@@ -74,13 +74,32 @@ class PhyscialServerInfo(SSHPlugin):
         return result
 
 
+# pyghmi 的 Command 要求 privlevel 为整数，而 CMDB 凭据里的 privilege 通常是字符串名称。
+_IPMI_PRIVILEGE_MAP = {
+    "callback": 1,
+    "user": 2,
+    "operator": 3,
+    "administrator": 4,
+}
+
+
+def _resolve_ipmi_privilege(privilege) -> int:
+    """把 IPMI 权限名称/数字字符串解析为 pyghmi 需要的整数 privlevel。"""
+    if isinstance(privilege, int):
+        return privilege
+    text = str(privilege or "administrator").strip().lower()
+    if text.isdigit():
+        return int(text)
+    return _IPMI_PRIVILEGE_MAP.get(text, _IPMI_PRIVILEGE_MAP["administrator"])
+
+
 class PhyscialServerIPMIInfo:
     def __init__(self, kwargs):
         self.host = kwargs.get("host", "")
         self.port = int(kwargs.get("port", 623))
         self.username = kwargs.get("username", kwargs.get("user", ""))
         self.password = kwargs.get("password", "")
-        self.privilege = kwargs.get("privilege")
+        self.privilege = _resolve_ipmi_privilege(kwargs.get("privilege"))
         self.model_id = kwargs.get("model_id", "physcial_server")
 
     async def list_all_resources(self):

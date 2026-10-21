@@ -57,7 +57,7 @@ class ConfigFileInfo(SSHPlugin):
         return rendered
 
     async def _execute_script(self, script_content: str) -> Dict[str, Any]:
-        exec_params = self._build_exec_params(script_content)
+        exec_params = await self._prepare_exec_params(script_content)
         execution_mode = "local" if self.node_info else "ssh"
         if execution_mode == "local":
             subject = f"{execution_mode}.execute.{self.node_info['id']}"

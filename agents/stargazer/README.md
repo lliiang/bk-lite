@@ -213,6 +213,34 @@ rg 'event=snmp_facts_collection_started|target=<ip>' stargazer.log
 rg 'event=collection_capacity' stargazer.log
 ```
 
+### 调试日志（DEBUG）
+
+服务启动时（`server.py`）默认把进程日志开到 DEBUG，因此能直接看到每个目标的
+`event=collection_progress`、`event=target_collection_started`，以及两条同步链路新增的明细：
+
+- 主机同步（`host.config`）：`host_sync_target_succeeded` / `host_sync_target_failed`，
+  包含每目标耗时、原始输出字节数、主机/进程/挂载/网卡条数；
+- 物理机同步（`physcial_server.config`）：`physcial_server_collect_started`、
+  `physcial_server_sync_target_succeeded`（`transport=ssh|ipmi|redfish`）、
+  `physcial_server_sync_target_failed` / `physcial_server_sync_target_empty`（SSH、IPMI 路径；
+  Redfish 失败沿用 `physical_server_redfish_collect_rejected|_failed`），包含传输方式、耗时和
+  库存条数；IPMI 失败还会带上 `privilege`、`error_type` 与 traceback（pyghmi 的空异常消息
+  不会再只剩 `None`）。
+
+用 `STARGAZER_LOG_LEVEL` 调整全局级别，例如恢复常规 INFO 日志量：
+
+```bash
+STARGAZER_LOG_LEVEL=INFO
+```
+
+为避免刷屏，`asyncio`、`httpx`、`urllib3`、`botocore` 等第三方库固定在 INFO。常用检索：
+
+```bash
+rg 'event=(host|physcial_server)_sync_target' stargazer.log
+rg 'event=physcial_server_sync_target_failed' stargazer.log
+```
+
+
 ## Host Remote
 
 Host Remote 提交返回 `Deferred`。每个目标使用独立 callback ID；可信上下文包含父任务 ID、

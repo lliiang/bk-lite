@@ -51,6 +51,9 @@ class SSHPlugin:
         self.password = params.get("password")
         self.private_key = params.get("private_key")
         self.passphrase = params.get("passphrase")
+        # 私钥是 PEM 多行文本，不能进 HTTP header：headers 只带 credential_id，
+        # 执行前再由 _ensure_private_key() 经 NATS 回取正文。
+        self.credential_id = str(params.get("credential_id") or "").strip()
         # header 常把缺省 port 打成 ""；params.get("port", 22) 无法回落到默认值
         self.port = self._coerce_port(params.get("port"), default=22)
         # 默认 60 秒。自定义脚本可传入 execute_timeout，上限 600 秒。
@@ -59,7 +62,7 @@ class SSHPlugin:
         self.probe_timeout = self._coerce_positive_float(params.get("timeout"), default=5.0)
         self.node_info = params.get("node_info", {})
         self.model_id = params.get("model_id")
-        self.collection_task_id = params.get("collection_task_id") or params.get("task_id") or ""
+        self.collection_task_id = params.get("collect_task_id") or params.get("collection_task_id") or params.get("task_id") or ""
 
         # NATS 请求超时 = 脚本执行超时 × 最大并发数
         # 原因：nats-executor 串行处理请求，排在队列后面的任务需要等待前面的任务完成
@@ -165,6 +168,24 @@ class SSHPlugin:
         )
         return content
 
+    async def _ensure_private_key(self) -> None:
+        """按 credential_id 回取私钥；已经拿到正文时不做任何远程调用。"""
+        if self.private_key or not self.credential_id:
+            return
+        if self.node_info:
+            # 目标节点本地执行不需要 SSH 认证。
+            return
+        from service.credential_loader import load_private_key
+
+        credential = await load_private_key(self.collection_task_id, self.credential_id)
+        self.private_key = credential["private_key"]
+        self.passphrase = credential.get("passphrase") or self.passphrase
+
+    async def _prepare_exec_params(self, script_content: str) -> Dict[str, Any]:
+        """构建执行参数前先补齐私钥；密码认证不会产生额外 RPC。"""
+        await self._ensure_private_key()
+        return self._build_exec_params(script_content)
+
     def _build_exec_params(self, script_content: str) -> Dict[str, Any]:
         """构建执行参数"""
         exec_params = {
@@ -230,7 +251,7 @@ class SSHPlugin:
     async def probe(self) -> AccessProbeResult:
         if self.node_info:
             return AccessProbeResult(status=AccessProbeStatus.READY)
-        exec_params = self._build_exec_params("true")
+        exec_params = await self._prepare_exec_params("true")
         subject = f"ssh.execute.{self.node_id}"
         payload = json.dumps({"args": [exec_params], "kwargs": {}}).encode()
         try:
@@ -287,7 +308,7 @@ class SSHPlugin:
             script_content = await asyncio.to_thread(self._read_script)
 
             # 2. 构建执行参数
-            exec_params = self._build_exec_params(script_content)
+            exec_params = await self._prepare_exec_params(script_content)
             # 3. 判断执行模式（本地 or SSH）
             execution_mode = "local" if self.node_info else "ssh"
             # 如果是local，则使用对应的node_id

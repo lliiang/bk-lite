@@ -3,7 +3,7 @@
 
 锁定 PC 任务（model_id=pc, driver_type=job）的节点参数：
 - Windows 固定 WinRM 参数透传（scheme/transport/cert_validation/port）；
-- macOS SSH 密码与私钥两种认证的占位符与 env_config 透传；
+- macOS SSH 密码走占位符与 env_config，私钥只下发 credential_id；
 - 秘密值只进 env_config，不以明文进 headers；
 - 多凭据池按既有 flatten 约定下发。
 """
@@ -91,6 +91,38 @@ def test_pc_node_params_macos_password_contract():
 
 
 def test_pc_node_params_macos_private_key_contract():
+    """PEM 是多行文本，进 HTTP header 会被拒；有引用时只下发 credential_id。"""
+    task = _fake_task(
+        credential={
+            "credential_id": "cred_pc_key01",
+            "username": "admin",
+            "private_key": "PEM-DATA",
+            "passphrase": "pp",
+            "port": 22,
+        },
+        params=MACOS_PARAMS,
+    )
+    node = NodeParamsFactory.get_node_params(task)
+    headers = node.custom_headers()
+
+    assert "cmdbprivate_key" not in headers
+    assert "cmdbpassphrase" not in headers
+    assert "cmdbpassword" not in headers
+    # Stargazer 据该引用经 NATS 回取私钥正文。
+    assert headers["cmdbcredential_id"] == "cred_pc_key01"
+    assert node.env_config() == {}
+    dumped = json.dumps(headers, ensure_ascii=False)
+    assert "PEM-DATA" not in dumped
+    assert "pp" not in dumped
+
+
+def test_pc_node_params_macos_inline_private_key_keeps_legacy_env_channel():
+    """无 credential_id 的历史直填私钥没有可回取的引用，仍走 PRIVATEKEY_* 占位符。
+
+    resolve_task_credential_pool() 在池中无 vault 条目时直接返回，不补 credential_id，
+    因此这条分支在存量任务上真实可达；多行 PEM 经 header 下发仍会遇到 CRLF 限制，
+    需要用户把凭据迁移到凭据管理后重新下发。
+    """
     task = _fake_task(
         credential={"username": "admin", "private_key": "PEM-DATA", "passphrase": "pp", "port": 22},
         params=MACOS_PARAMS,
@@ -98,15 +130,14 @@ def test_pc_node_params_macos_private_key_contract():
     node = NodeParamsFactory.get_node_params(task)
     headers = node.custom_headers()
 
+    assert "cmdbcredential_id" not in headers
+    # header 只含单行占位符，真实 PEM 走 Telegraf 进程环境变量。
     assert headers["cmdbprivate_key"] == "${PRIVATEKEY_private_key_cmdb_321}"
     assert headers["cmdbpassphrase"] == "${PASSPHRASE_passphrase_cmdb_321}"
-    assert "cmdbpassword" not in headers
-    env = node.env_config()
-    assert env["PRIVATEKEY_private_key_cmdb_321"] == "PEM-DATA"
-    assert env["PASSPHRASE_passphrase_cmdb_321"] == "pp"
-    dumped = json.dumps(headers, ensure_ascii=False)
-    assert "PEM-DATA" not in dumped
-    assert "pp" not in dumped
+    assert node.env_config() == {
+        "PRIVATEKEY_private_key_cmdb_321": "PEM-DATA",
+        "PASSPHRASE_passphrase_cmdb_321": "pp",
+    }
 
 
 def test_pc_node_params_credentials_pool_flattened():

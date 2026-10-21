@@ -171,11 +171,12 @@ def test_ssh_node_params_supports_private_key_and_password_candidates_without_he
     node = HostNodeParams(instance)
     headers = node.custom_headers()
     env = node.env_config()
-    assert headers["cmdbcredential_0_private_key"] == "${PRIVATEKEY_private_key_cmdb_93_0}"
-    assert headers["cmdbcredential_0_passphrase"] == "${PASSPHRASE_passphrase_cmdb_93_0}"
+    # 私钥是 PEM 多行文本，headers 只携带 credential_id，正文由 Stargazer 运行期回取
+    assert "cmdbcredential_0_private_key" not in headers
+    assert "cmdbcredential_0_passphrase" not in headers
+    assert headers["cmdbcredential_0_credential_id"] == "cred-key"
     assert headers["cmdbcredential_1_password"] == "${PASSWORD_password_cmdb_93_1}"
-    assert env["PRIVATEKEY_private_key_cmdb_93_0"] == "secret-key-data"
-    assert env["PASSWORD_password_cmdb_93_1"] == "secret-password"
+    assert env == {"PASSWORD_password_cmdb_93_1": "secret-password"}
     assert all(secret not in str(headers) for secret in ("secret-key-data", "secret-passphrase", "secret-password"))
 
 
@@ -419,6 +420,52 @@ def test_base_node_params_single_credential_keeps_legacy_headers():
     assert headers["cmdbpassword"] == "${PASSWORD_password_cmdb_94}"
     assert headers["cmdbcredential_id"] == "cred-1"
     assert node.env_config()["PASSWORD_password_cmdb_94"] == "first-secret"
+
+
+def test_host_node_params_multicred_private_key_ships_reference_only():
+    """多凭据池里私钥条目只下发 credential_id，正文与占位符都不进 header。
+
+    PEM 是多行文本，HTTP header 禁止 CRLF；Telegraf 的 TOML 字符串也承载不了换行。
+    Stargazer 运行期据 credential_id 经 NATS RPC 回取正文。
+    """
+    from apps.cmdb.node_configs.ssh.host import HostNodeParams
+
+    pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAAB3Nza\n-----END OPENSSH PRIVATE KEY-----"
+    instance = SimpleNamespace(
+        id=95,
+        model_id="host",
+        driver_type="job",
+        decrypt_credentials=[
+            {"credential_id": "cred-pw", "username": "u1", "password": "pw-secret", "port": 22},
+            {
+                "credential_id": "cred-key",
+                "username": "u2",
+                "auth_method": "key",
+                "private_key": pem,
+                "passphrase": "pp",
+                "port": 22,
+            },
+        ],
+        params={},
+        timeout=60,
+        access_point=[{"id": 3}],
+        instances=[{"ip_addr": "10.0.0.11"}],
+        ip_range="",
+    )
+
+    node = HostNodeParams(instance)
+    headers = node.custom_headers()
+
+    assert headers["cmdbcredential_count"] == "2"
+    assert headers["cmdbcredential_0_credential_id"] == "cred-pw"
+    assert headers["cmdbcredential_0_password"] == "${PASSWORD_password_cmdb_95_0}"
+    assert headers["cmdbcredential_1_credential_id"] == "cred-key"
+    assert "cmdbcredential_1_private_key" not in headers
+    assert "cmdbcredential_1_passphrase" not in headers
+    assert "cmdbcredential_1_password" not in headers
+    assert pem not in str(headers)
+    # 私钥改由回取获取，不再需要注入 Telegraf 进程环境。
+    assert node.env_config() == {"PASSWORD_password_cmdb_95_0": "pw-secret"}
 
 
 def test_network_node_params_device_channel_disables_inline_topo():

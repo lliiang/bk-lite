@@ -3234,3 +3234,6 @@ def topo_search_expand_by_uuid(inst_uuid=None, parent_uuids=None, depth=2, user_
 
 # 注册机房大屏统计。apps.py 只导入本模块，这里再把处理函数挂上。
 from apps.cmdb.nats import room_screen_stats  # noqa: E402,F401
+
+# 注册采集凭据回取（SSH 私钥不进 headers，运行期按 credential_id 回取）。
+from apps.cmdb.nats import collect_credential  # noqa: E402,F401

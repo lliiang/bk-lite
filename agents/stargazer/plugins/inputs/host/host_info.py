@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import time
 from typing import Any, Dict, List
 
 from core.logger import logger
@@ -7,6 +8,7 @@ from plugins.script_executor import SSHPlugin
 
 class HostInfo(SSHPlugin):
     async def list_all_resources(self, need_raw=False) -> Dict[str, Any]:
+        started_at = time.monotonic()
         try:
             logger.debug(
                 "event=host_collect_started host=%s model_id=%s task_id=%s",
@@ -20,6 +22,13 @@ class HostInfo(SSHPlugin):
                 return data
 
             if not data.get("success"):
+                logger.debug(
+                    "event=host_sync_target_failed host=%s model_id=%s task_id=%s failed_stage=remote_script duration_ms=%s",
+                    self.host,
+                    self.model_id,
+                    self.collection_task_id,
+                    round((time.monotonic() - started_at) * 1000, 2),
+                )
                 return data
 
             collect_output = data.get("result", "")
@@ -58,6 +67,19 @@ class HostInfo(SSHPlugin):
                 result["host_mount"] = host_mount_items
             if host_nic_items:
                 result["host_nic"] = host_nic_items
+            logger.debug(
+                "event=host_sync_target_succeeded host=%s model_id=%s task_id=%s duration_ms=%s raw_bytes=%s "
+                "host_count=%s proc_count=%s mount_count=%s nic_count=%s",
+                self.host,
+                self.model_id,
+                self.collection_task_id,
+                round((time.monotonic() - started_at) * 1000, 2),
+                len(collect_output or ""),
+                len(host_items),
+                len(host_proc_items),
+                len(host_mount_items),
+                len(host_nic_items),
+            )
             logger.info(
                 "event=host_collect_completed success=%s host=%s model_id=%s task_id=%s host_count=%s proc_count=%s",
                 True,

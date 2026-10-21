@@ -25,6 +25,8 @@ services:
       - NATS_INSTANCE_ID=${ZONE_NAME}
       - NATS_URLS=tls://${NATS_ADMIN_USERNAME}:${NATS_ADMIN_PASSWORD}@nats:4222
       - NATS_CA_FILE=/etc/nats/certs/ca.crt
+      # 默认 info；排查时用 LOG_LEVEL=debug docker compose up -d nats-executor 临时开启
+      - LOG_LEVEL=${LOG_LEVEL:-info}
     networks:
       - prod
     restart: always

@@ -2,6 +2,7 @@ import asyncio
 import ipaddress
 import json
 import ssl
+import time
 from urllib.parse import unquote, urlsplit
 
 import httpx
@@ -437,9 +438,17 @@ class PhyscialServerRedfishInfo:
             )
 
     async def list_all_resources(self):
+        started_at = time.monotonic()
         try:
             if not self.username or not self.password:
                 raise RedfishCollectionError("Redfish username and password are required")
+            logger.debug(
+                "event=physcial_server_redfish_collect_started host=%s port=%s task_id=%s verify_tls=%s",
+                safe_log_value(self.host),
+                self.port,
+                safe_log_value(self.collection_task_id or "-"),
+                self.verify_tls,
+            )
             async with self._client() as client:
                 root = await self._get_json(client, "/redfish/v1/")
                 members = await self._get_system_members(client, root.get("Systems"))
@@ -459,6 +468,19 @@ class PhyscialServerRedfishInfo:
                 "power_state": system.get("PowerState"),
                 "health": status.get("Health"),
             }
+            logger.debug(
+                "event=physcial_server_sync_target_succeeded transport=redfish host=%s port=%s task_id=%s "
+                "duration_ms=%s processors=%s memory=%s drives=%s nic_records=%s power_supplies=%s",
+                safe_log_value(self.host),
+                self.port,
+                safe_log_value(self.collection_task_id or "-"),
+                round((time.monotonic() - started_at) * 1000, 2),
+                len(inventory.get("processors") or ()),
+                len(inventory.get("memory") or ()),
+                len(inventory.get("drives") or ()),
+                len(inventory.get("nic_records") or ()),
+                len(inventory.get("power_supplies") or ()),
+            )
             return {"success": True, "result": build_redfish_result(server, **inventory)}
         except RedfishCollectionError as exc:
             logger.warning(

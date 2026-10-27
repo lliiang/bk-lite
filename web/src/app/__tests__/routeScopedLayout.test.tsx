@@ -30,6 +30,14 @@ vi.mock('@/components/spin', () => ({
   default: () => <div data-testid="route-loader" />,
 }));
 
+vi.mock('@/app/ops-analysis/context/effectiveHomepage', () => ({
+  EffectiveHomepageProvider: ({ children }: { children: React.ReactNode }) => children,
+}));
+
+vi.mock('@/app/ops-analysis/context/homepagePreference', () => ({
+  HomepagePreferenceProvider: ({ children }: { children: React.ReactNode }) => children,
+}));
+
 vi.mock('@/context/userInfo', () => ({
   UserInfoProvider: ({ children }: { children: React.ReactNode }) => {
     providerCalls.userInfo();

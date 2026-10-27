@@ -1177,6 +1177,7 @@ class InstanceManage(object):
             for_update=False,
         )
         prepared = []
+        subnet_batch_state = {} if model_id == "subnet" else None
         for index, item in enumerate(instances):
             try:
                 instance_info = prepare_new_instance_identity({**item, "model_id": model_id})
@@ -1190,7 +1191,7 @@ class InstanceManage(object):
                 if model_id == "subnet":
                     from apps.cmdb.services.ipam_subnet import validate_subnet_no_overlap
 
-                    validate_subnet_no_overlap(instance_info)
+                    validate_subnet_no_overlap(instance_info, batch_state=subnet_batch_state)
                 instance_info = get_instance_enterprise_extension().normalize_file_fields(
                     model_id,
                     instance_info,
@@ -2463,15 +2464,21 @@ class InstanceManage(object):
         file_stream: bytes,
         operator: str,
         allowed_org_ids: list = None,
+        matched_instance_permission_check=None,
     ):
         """实例导入-支持编辑"""
         attrs = ModelManage.search_model_attr_v2(model_id)
         model_info = ModelManage.search_model_info(model_id)
 
+        permission_check = matched_instance_permission_check
+        if permission_check is None:
+            permission_check = getattr(self, "matched_instance_permission_check", None)
+
         _import = Import(model_id, attrs, [], operator)
         add_results, update_results, asso_result = _import.import_inst_list_support_edit(
             file_stream,
             allowed_org_ids=allowed_org_ids,
+            matched_instance_permission_check=permission_check,
         )
 
         add_changes = [

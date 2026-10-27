@@ -13,6 +13,7 @@ import ViewConfig from '@/app/ops-analysis/components/widgetConfig';
 import { mergeSanitizedWidgetValueConfig, omitForeignChartTypeFields } from '@/app/ops-analysis/components/widgetConfig/utils/submitConfig';
 import DashboardCanvas from './components/dashboardCanvas';
 import DashboardToolbar from './components/dashboardToolbar';
+import HomepageViewToolbar from '@/app/ops-analysis/components/homepageViewToolbar';
 import DashboardSubscriptionModal from '@/app/ops-analysis/components/dashboardSubscriptionModal';
 import ViewWorkspace from '../components/viewWorkspace';
 import { Modal, message, Select } from 'antd';
@@ -66,6 +67,15 @@ import {
 import 'react-resizable/css/styles.css';
 import { useSession } from 'next-auth/react';
 import { useDashboardLayoutSync } from './hooks/useDashboardLayoutSync';
+import {
+  DASHBOARD_GRID_COLS,
+  scaleDashboardGridSpan,
+} from '@/app/ops-analysis/utils/dashboardGridColumns';
+import {
+  migrateDashboardGridLayout,
+  scaleDashboardGridHeight,
+  withCurrentDashboardGrid,
+} from '@/app/ops-analysis/utils/dashboardGridRows';
 import {
   deserializeDashboardGridStackLayout,
   serializeDashboardGridStackLayout,
@@ -140,6 +150,8 @@ interface DashboardProps {
   renderMode?: boolean;
   renderFilterValues?: Record<string, FilterValue>;
   renderDataSourceIds?: number[];
+  /** 登录首页：只读已保存内容，隐藏筛选条和编辑工具。 */
+  homepageMode?: boolean;
 }
 
 export interface DashboardRef {
@@ -154,6 +166,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
     renderMode = false,
     renderFilterValues,
     renderDataSourceIds,
+    homepageMode = false,
   }, ref) => {
     const { t } = useTranslation();
     const labelStoredFilters = useCallback(
@@ -328,7 +341,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
         desc: selectedDashboard?.desc || '',
         view_sets: serializeDashboardGridStackLayout(layout),
         filters: definitions,
-        other: otherConfig,
+        other: withCurrentDashboardGrid(otherConfig),
         refresh_interval: savedRefreshInterval,
       }),
       [
@@ -342,7 +355,11 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
     );
     const applyDashboardDraftPayload = useCallback(
       (payload: CanvasDraftPayload) => {
-        const nextLayout = deserializeDashboardGridStackLayout(payload.view_sets);
+        const migratedDraft = migrateDashboardGridLayout(
+          deserializeDashboardGridStackLayout(payload.view_sets),
+          (payload.other as OtherConfig) || {},
+        );
+        const nextLayout = migratedDraft.layout;
         const loadedDefinitions = labelStoredFilters(Array.isArray(
           payload.filters,
         )
@@ -356,7 +373,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
 
         restoreDraftRefreshInterval(payload, setSavedRefreshInterval);
         setLayout(nextLayout);
-        setOtherConfig((payload.other as OtherConfig) || {});
+        setOtherConfig(migratedDraft.other);
         setDefinitions(loadedDefinitions);
         setFilterValues(nextValues);
         applyQueryState(loadedDefinitions, nextValues, appliedNamespaceId);
@@ -381,6 +398,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
         isEditMode &&
           !shareMode &&
           !renderMode &&
+          !homepageMode &&
           dashboardDraftResourceId &&
           !selectedDashboard?.is_build_in,
       ),
@@ -579,7 +597,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
           if (!isCurrentLoad()) {
             return;
           }
-          const nextLayout = deserializeDashboardGridStackLayout(
+          const preparedLayout = deserializeDashboardGridStackLayout(
             dashboardData.view_sets,
           ).map((item) => {
             if (!isDashboardWidgetItem(item) || !item.valueConfig) {
@@ -611,6 +629,11 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
               },
             };
           });
+          const migratedGrid = migrateDashboardGridLayout(
+            preparedLayout,
+            dashboardData.other || {},
+          );
+          const nextLayout = migratedGrid.layout;
           await syncDashboardCanvasResourcesRef.current(nextLayout);
           if (!isCurrentLoad()) {
             return;
@@ -626,7 +649,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
 
           setCollapsedGroupsLayoutReadyId(dashboard.data_id);
 
-          const savedOtherConfig = dashboardData.other || {};
+          const savedOtherConfig = migratedGrid.other;
           setOtherConfig(savedOtherConfig);
           setOriginalOtherConfig({ ...savedOtherConfig });
           setSavedRefreshInterval(
@@ -643,7 +666,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
           const loadedDefinitions = labelStoredFilters(storedFilters.definitions);
           const migratedValues = storedFilters.values;
 
-          const initialValues = fillMissingOrganizationFilterValues(
+          const filledValues = fillMissingOrganizationFilterValues(
             loadedDefinitions,
             syncFilterValuesWithDefinitions(
               loadedDefinitions,
@@ -651,6 +674,13 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
             ),
             selectedOrganizationIdRef.current,
           );
+          const initialValues = homepageMode
+            ? applySelectedOrganizationToFilterValues(
+              loadedDefinitions,
+              filledValues,
+              selectedOrganizationIdRef.current,
+            )
+            : filledValues;
 
           setDefinitions(loadedDefinitions);
           setFilterValues(initialValues);
@@ -698,6 +728,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
       };
     }, [
       dashboardId,
+      homepageMode,
       labelStoredFilters,
       renderMode,
       renderFilterValues,
@@ -966,6 +997,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
 
     useEffect(() => {
       return registerToolResultHandler(DASHBOARD_APPLY_TOOL, (result) => {
+        if (homepageMode) return;
         if (!claimToolCall(appliedToolCallsRef.current, result.toolCallId)) return;
         const current = applyProposalRef.current;
         if (current.shareMode) return;
@@ -1006,7 +1038,10 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
         setLayout(syncedLayout);
         syncFilterStateAfterLayoutChange(mergedFilters, nextValues, nextValues);
         if (applied.otherConfig) {
-          setOtherConfig((current) => ({ ...current, ...applied.otherConfig }));
+          setOtherConfig((current) => withCurrentDashboardGrid({
+            ...current,
+            ...applied.otherConfig,
+          }));
         }
         if (applied.refreshInterval != null) {
           setSavedRefreshInterval(applied.refreshInterval);
@@ -1029,6 +1064,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
       syncDashboardCanvasResources,
       syncFilterStateAfterLayoutChange,
       syncFilterValuesWithDefinitions,
+      homepageMode,
       syncLayoutFilterBindings,
       t,
     ]);
@@ -1061,10 +1097,13 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
     ]);
 
     const openAddModal = useCallback((groupId?: string) => {
+      if (homepageMode) {
+        return;
+      }
       setIsEditMode(true);
       setPendingNewWidgetGroupId(groupId ?? null);
       setAddModalVisible(true);
-    }, []);
+    }, [homepageMode]);
 
     const closeAddModal = () => {
       setAddModalVisible(false);
@@ -1235,6 +1274,9 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
             descriptionField: config.descriptionField,
             topNLabelField: config.topNLabelField,
             topNValueField: config.topNValueField,
+            topNScalarFields: config.topNScalarFields,
+            barMode: config.barMode,
+            barMax: config.barMax,
             dimensionField: config.dimensionField,
             valueField: config.valueField,
             multiValueLabelField: config.multiValueLabelField,
@@ -1259,6 +1301,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
             gaugeShape: config.gaugeShape,
             cardList: config.cardList,
             compare: config.compare,
+            singleStyle: config.singleStyle,
             interaction: config.interaction,
             actions: config.actions,
           },
@@ -1331,7 +1374,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
           name: selectedDashboard.name,
           desc: selectedDashboard.desc || '',
           filters: definitions,
-          other: otherConfig,
+          other: withCurrentDashboardGrid(otherConfig),
           view_sets: serializeDashboardGridStackLayout(layout),
         };
         await saveDashboard(selectedDashboard.data_id, saveData);
@@ -1353,8 +1396,10 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
           applyQueryState(definitions, nextApplied.values, appliedNamespaceId);
           setFilterSearchVersion((prev) => prev + 1);
         }
+        const savedOtherConfig = saveData.other;
+        setOtherConfig(savedOtherConfig);
         setOriginalLayout([...layout]);
-        setOriginalOtherConfig({ ...otherConfig });
+        setOriginalOtherConfig({ ...savedOtherConfig });
         setOriginalDefinitions([...definitions]);
         setIsEditMode(false);
         setUndoStack([]);
@@ -1368,17 +1413,20 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
     };
 
     const toggleEditMode = () => {
+      if (homepageMode) {
+        return;
+      }
       setIsEditMode(!isEditMode);
     };
 
     useEffect(() => {
-      if (isFullscreen || !resumeEditModeAfterFullscreenRef.current) {
+      if (homepageMode || isFullscreen || !resumeEditModeAfterFullscreenRef.current) {
         return;
       }
 
       resumeEditModeAfterFullscreenRef.current = false;
       setIsEditMode(true);
-    }, [isFullscreen]);
+    }, [homepageMode, isFullscreen]);
 
     // 全屏切换只改 chrome 可见性，不 remount canvas；通知 GridStack/图表按新容器尺寸重算
     useEffect(() => {
@@ -1573,8 +1621,8 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
           itemType: 'group',
           x: 0,
           y: nextY,
-          w: 12,
-          h: 1,
+          w: DASHBOARD_GRID_COLS,
+          h: scaleDashboardGridHeight(1),
           name: nextName,
         };
 
@@ -1716,8 +1764,8 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
         i: '',
         x: 0,
         y: 0,
-        w: item.defaultWidth,
-        h: item.defaultHeight,
+        w: scaleDashboardGridSpan(item.defaultWidth),
+        h: scaleDashboardGridHeight(item.defaultHeight),
         name: item.name,
         description: item.desc,
         valueConfig: {
@@ -1761,6 +1809,9 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
                   descriptionField: values.descriptionField,
                   topNLabelField: values.topNLabelField,
                   topNValueField: values.topNValueField,
+                  topNScalarFields: values.topNScalarFields,
+                  barMode: values.barMode,
+                  barMax: values.barMax,
                   dimensionField: values.dimensionField,
                   valueField: values.valueField,
                   multiValueLabelField: values.multiValueLabelField,
@@ -1786,6 +1837,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
                   cardList: values.cardList,
                   compare: values.compare,
                   compareMode: values.compareMode,
+                  singleStyle: values.singleStyle,
                   interaction: values.interaction,
                   actions: values.actions,
                 },
@@ -1945,7 +1997,9 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
       void openShare(selectedDashboard?.data_id);
     };
 
-    const dashboardToolbar = renderMode ? null : (
+    const dashboardToolbar = renderMode ? null : homepageMode ? (
+      <HomepageViewToolbar dashboardId={selectedDashboard?.data_id} />
+    ) : (
       <DashboardToolbar
         selectedDashboard={selectedDashboard}
         chartTheme={chartTheme}
@@ -1980,7 +2034,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
       />
     );
 
-    const dashboardFilterBar = (definitions.length > 0 ||
+    const dashboardFilterBar = !homepageMode && (definitions.length > 0 ||
       namespaceSelectorElement) && (
       <UnifiedFilterBar
         definitions={definitions}
@@ -2019,6 +2073,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
           appliedFilterDefinitions={appliedFilterDefinitions}
           appliedNamespaceId={appliedNamespaceId}
           selectedDashboardLocked={selectedDashboard?.is_build_in}
+          csvExportHidden={homepageMode}
           shareMode={shareMode}
           isFullscreen={isFullscreen}
           onOpenAddModal={openAddModal}
@@ -2086,6 +2141,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
             emptyDescription={t('dashboard.selectDashboardFirst')}
             headerVisible={!isFullscreen}
             filterBarVisible
+            compactHeader={homepageMode}
             toolbar={dashboardToolbar}
             filterBar={dashboardFilterBar}
             contentRef={exportRef}

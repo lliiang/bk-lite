@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Tooltip } from 'antd';
 import { useDashboardText } from '../../../shared/utils/content-i18n';
 import { HOST_SERIES_COLOR } from '../config';
@@ -26,7 +26,7 @@ export const countHotMounts = (rows: EntityTableRow[]) => (
 );
 
 type DiskSub = 'mount' | 'device';
-type RateUnit = 'byteps' | 'cps' | 'ms';
+type RateUnit = 'byteps' | 'cps' | 'ms' | 'percent';
 
 const formatLatencyPair = (row: EntityTableRow) => {
   const read = row.values.disk_read_latency;
@@ -103,6 +103,14 @@ const DEVICE_CHARTS: Array<{
       { key: 'disk_read_latency', labelKey: 'read', color: HOST_SERIES_COLOR.diskRead },
       { key: 'disk_write_latency', labelKey: 'write', color: HOST_SERIES_COLOR.diskWrite }
     ]
+  },
+  {
+    key: 'util',
+    titleKey: 'ioUtilization',
+    unit: 'percent',
+    series: [
+      { key: 'diskio_io_util', labelKey: 'ioUtilization', color: HOST_SERIES_COLOR.diskUsed }
+    ]
   }
 ];
 
@@ -142,7 +150,22 @@ export default function DiskPane({
   const mountTitle = mountPath
     ? hostCategoryText(t, 'mountUsedNamed', { name: mountPath })
     : hostCategoryText(t, 'mountUsed');
-  const mountPoints = selectedMount?.series.disk_used_percent || [];
+  const mountSeries = selectedMount?.series.disk_used_percent;
+  const mountPoints = mountSeries || [];
+  const mountChartData = useMemo(
+    () => pointsToChartData(mountSeries?.length ? [{ points: mountSeries }] : []),
+    [mountSeries]
+  );
+  const deviceChartModels = useMemo(() => DEVICE_CHARTS.map((chart) => {
+    const present = chart.series.filter((item) => (selectedDevice?.series[item.key] || []).length > 0);
+    return {
+      chart,
+      present,
+      data: pointsToChartData(present.map((item) => ({
+        points: selectedDevice?.series[item.key] || []
+      })))
+    };
+  }), [selectedDevice]);
 
   const openDevice = (key: string) => {
     onSelectDevice(key);
@@ -296,7 +319,7 @@ export default function DiskPane({
               loading={loading && mountPoints.length === 0}
               unit="percent"
               emptyText={emptyText}
-              data={pointsToChartData(mountPoints.length ? [{ points: mountPoints }] : [])}
+              data={mountChartData}
               legends={[{
                 label: hostCategoryText(t, 'utilization'),
                 color: HOST_SERIES_COLOR.diskUsed
@@ -329,9 +352,8 @@ export default function DiskPane({
         </>
       ) : (
         <>
-          <div className={`${styles.chartGrid3} ${styles.diskDeviceCharts}`}>
-            {DEVICE_CHARTS.map((chart) => {
-              const present = chart.series.filter((item) => (selectedDevice?.series[item.key] || []).length > 0);
+          <div className={`${styles.chartGrid2} ${styles.diskDeviceCharts}`}>
+            {deviceChartModels.map(({ chart, present, data }) => {
               const legendSource = present.length ? present : chart.series;
               return (
                 <ThinTimeSeries
@@ -340,9 +362,7 @@ export default function DiskPane({
                   loading={loading && present.length === 0}
                   unit={chart.unit}
                   emptyText={emptyText}
-                  data={pointsToChartData(present.map((item) => ({
-                    points: selectedDevice?.series[item.key] || []
-                  })))}
+                  data={data}
                   legends={legendSource.map((item) => {
                     const reading = present.length
                       ? legendReading(latestPreferSignal(selectedDevice?.series[item.key]), chart.unit)

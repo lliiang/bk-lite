@@ -105,12 +105,19 @@ import {
 } from './templateSaveIssues';
 import {
   buildMetricExpressionQueryCondition,
+  ConditionCount,
+  ConditionSource,
   createMetricRow,
   DEFAULT_FORMULA_EXPRESSION,
   DEFAULT_FORMULA_RESULT_NAME,
   findCatalogMetric,
   getMetricExpressionModeForRows,
   MetricExpressionMode,
+  omitMultiMirrorFields,
+  rowsAfterEnteringFormula,
+  rowsAfterEnteringMulti,
+  rowsAfterLeavingMulti,
+  shouldWarnQueryTypeChange,
   resolveHydratedMetricFields,
   resolveMetricExpressionUnits,
   toMetricExpressionStateFromQueryCondition,
@@ -129,7 +136,7 @@ const StrategyOperation = () => {
     const value = t(key);
     return value === key ? fallback : value;
   };
-  const { post, put, isLoading } = useApiClient();
+  const { get, post, put, isLoading } = useApiClient();
   const {
     getMetricsGroup,
     getMonitorMetrics,
@@ -170,8 +177,11 @@ const StrategyOperation = () => {
   const detailId = searchParams.get('id');
   const detailName = searchParams.get('name') || '--';
   const templateKey = searchParams.get('template_key') || '';
+  const policyGroupId = searchParams.get('groupId') || '';
+  const ruleId = searchParams.get('ruleId') || '';
   const isCreateFlow = ['builtIn', 'add'].includes(type);
   const isEditTemplate = type === 'editTemplate';
+  const isGroupRule = type === 'groupRule';
   const { getGroupIds, ready: objectConfigReady } = useObjectConfigInfo(monitorName);
   const [pageLoading, setPageLoading] = useState<boolean>(false);
   const [confirmLoading, setConfirmLoading] = useState<boolean>(false);
@@ -214,6 +224,7 @@ const StrategyOperation = () => {
   ]);
   const [metricExpressionMode, setMetricExpressionMode] =
     useState<MetricExpressionMode>('metric');
+  const savedQueryTypeRef = useRef<string | null>(null);
   const [formulaResultName, setFormulaResultName] = useState<string>(
     () =>
       translateWithFallback(
@@ -687,12 +698,15 @@ const StrategyOperation = () => {
   useEffect(() => {
     const nextLabelsByRef: Record<string, string[]> = {};
     metricRows.forEach((row) => {
-      const target = metrics.find(
-        (item) =>
-          (row.metricId != null && String(item.id) === String(row.metricId)) ||
-          (!!row.metricName && item.name === row.metricName)
-      );
-      nextLabelsByRef[row.ref] = getMetricDimensionNames(target?.dimensions);
+      const carriers = row.source === 'formula' ? row.operands || [] : [row];
+      carriers.forEach((carrier) => {
+        const target = metrics.find(
+          (item) =>
+            (carrier.metricId != null && String(item.id) === String(carrier.metricId)) ||
+            (!!carrier.metricName && item.name === carrier.metricName)
+        );
+        nextLabelsByRef[carrier.ref] = getMetricDimensionNames(target?.dimensions);
+      });
     });
     setLabelsByRef(nextLabelsByRef);
 
@@ -975,9 +989,18 @@ const StrategyOperation = () => {
               name
             );
             if (matched) {
-              return { ...row, metricId: matched.id, metricName: matched.name };
+              return {
+                ...row,
+                metricId: matched.id,
+                metricName: matched.name,
+                metricLabel: matched.display_name || matched.name
+              };
             }
-            return { ...row, metricName: name };
+            return {
+              ...row,
+              metricName: name,
+              metricLabel: String(stored?.display_name || name)
+            };
           })
         );
       })
@@ -992,6 +1015,7 @@ const StrategyOperation = () => {
       rawQuery as Parameters<typeof resolveQueryConditionMetricIds>[0],
       initMetricData
     ) || rawQuery;
+    savedQueryTypeRef.current = query_condition?.type || null;
     if (query_condition?.type === 'metric') {
       const rememberedName =
         query_condition?.metric_id != null
@@ -1096,6 +1120,42 @@ const StrategyOperation = () => {
       );
       setFormulaResultName(restoredState.resultName);
       setFormulaExpression(restoredState.expression);
+      setMetric(rows[0]?.metricName || null);
+      setConditions(rows[0]?.filters || []);
+      setGroupBy(sanitizeGroupBy(rows[0]?.groupBy || []));
+      setGroupAlgorithm(rows[0]?.groupAlgorithm || 'avg');
+    } else if (query_condition?.type === 'multi') {
+      const restoredState = toMetricExpressionStateFromQueryCondition(
+        query_condition
+      );
+      const rows = restoredState.rows.map((row) => {
+        const rememberedName =
+          row.metricId != null
+            ? storedMetricNameByIdRef.current.get(String(row.metricId))
+            : undefined;
+        const hydrated = resolveHydratedMetricFields(
+          initMetricData,
+          row.metricId,
+          row.metricName || rememberedName
+        );
+        const catalog = findCatalogMetric(
+          initMetricData,
+          hydrated.metricId,
+          hydrated.metricName
+        );
+        return {
+          ...row,
+          metricId: hydrated.metricId,
+          metricName: hydrated.metricName,
+          metricLabel: catalog?.display_name || hydrated.metricName
+        };
+      });
+      lookupStoredMetrics(
+        rows.filter((row) => !row.metricName).map((row) => row.metricId)
+      );
+      setMetricRows(rows);
+      setMetricExpressionMode('multi');
+      setFormulaResultName(restoredState.resultName);
       setMetric(rows[0]?.metricName || null);
       setConditions(rows[0]?.filters || []);
       setGroupBy(sanitizeGroupBy(rows[0]?.groupBy || []));
@@ -1209,6 +1269,13 @@ const StrategyOperation = () => {
   };
 
   const getStragyDetail = async () => {
+    if (isGroupRule) {
+      const data = await get('/monitor/api/policy_group/rule_editor/', {
+        params: { group_id: policyGroupId, rule_id: ruleId },
+      });
+      setFormData(data);
+      return;
+    }
     const data = await getMonitorPolicy(detailId);
     setFormData(data);
   };
@@ -1244,12 +1311,66 @@ const StrategyOperation = () => {
     });
   };
 
+  const handleExpressionModeChange = (next: MetricExpressionMode) => {
+    if (next === 'auto') {
+      return;
+    }
+    if (
+      shouldWarnQueryTypeChange({
+        isPersisted: Boolean(detailId),
+        savedType: savedQueryTypeRef.current,
+        nextType: next
+      })
+    ) {
+      message.warning(
+        translateWithFallback(
+          'monitor.events.modeSwitchClosesAlerts',
+          '保存后该策略下未恢复的告警会结束'
+        )
+      );
+    }
+    const previous = metricExpressionMode;
+    setMetricExpressionMode(next);
+    if (next === 'multi') {
+      setMetricRows((current) =>
+        rowsAfterEnteringMulti(current, {
+          algorithm: algorithm || 'avg_over_time',
+          groupBy
+        })
+      );
+      return;
+    }
+    if (next === 'formula' && previous !== 'formula') {
+      setMetricRows((current) => rowsAfterEnteringFormula(current));
+      setFormulaExpression(DEFAULT_FORMULA_EXPRESSION);
+      return;
+    }
+    if (previous === 'multi' || (previous === 'formula' && next === 'metric')) {
+      setMetricRows((current) => rowsAfterLeavingMulti(current));
+      setMetric(metricRows[0]?.metricName || null);
+    }
+  };
+
+  const handleConditionCountChange = (count: ConditionCount) => {
+    const current = metricExpressionMode === 'multi' ? 'multi' : 'single';
+    if (count === current) {
+      return;
+    }
+    handleExpressionModeChange(count === 'multi' ? 'multi' : 'metric');
+  };
+
+  const handleConditionSourceChange = (source: ConditionSource) => {
+    if (metricExpressionMode === 'multi') {
+      return;
+    }
+    handleExpressionModeChange(source);
+  };
+
   const handleMetricRowsChange = (rows: MetricExpressionRow[]) => {
     const previousPrimaryMetricName = metricRows[0]?.metricName;
     const nextPrimaryMetricName = rows[0]?.metricName;
     const previousMode = metricExpressionMode;
-    const nextMode = getMetricExpressionModeForRows(rows);
-    setMetricExpressionMode(nextMode);
+    const nextMode = getMetricExpressionModeForRows(rows, metricExpressionMode);
     setMetricRows(rows);
 
     if (nextMode === 'formula') {
@@ -1457,6 +1578,10 @@ const StrategyOperation = () => {
   };
 
   const goBack = () => {
+    if (isGroupRule) {
+      router.push(`/monitor/event/policy-group?objId=${monitorObjId || ''}&groupId=${policyGroupId}&rules=1`);
+      return;
+    }
     const targetUrl = `/monitor/event/${
       type === 'builtIn' || isEditTemplate ? 'template' : 'strategy'
     }?objId=${monitorObjId}`;
@@ -1536,9 +1661,11 @@ const StrategyOperation = () => {
         ? { metricUnit: '', calculationUnit: '', thresholdUnit: '' }
         : resolveMetricExpressionUnits({
           queryType:
-            metricExpressionMode === 'formula' || metricRows.length > 1
+            metricExpressionMode === 'formula'
               ? 'formula'
-              : 'metric',
+              : metricExpressionMode === 'multi'
+                ? 'multi'
+                : 'metric',
           metricUnit: selectedMetricSourceUnit,
           calculationUnit: effectiveCalculationUnit,
           thresholdUnit: effectiveThresholdUnit
@@ -1632,6 +1759,9 @@ const StrategyOperation = () => {
       params.recovery_condition = params.recovery_condition || 0;
       params.group_by = sanitizeGroupBy(metricRows[0]?.groupBy || groupBy);
       params.enable = true;
+      if (metricExpressionMode === 'multi') {
+        return omitMultiMirrorFields(params);
+      }
       return params;
   };
 
@@ -1853,6 +1983,42 @@ const StrategyOperation = () => {
           ? 'common.successfullyAdded'
           : 'common.successfullyModified'
       );
+      if (isGroupRule) {
+        const editable = { ...(params as unknown as Record<string, unknown>) };
+        [
+          'source',
+          'organizations',
+          'schedule',
+          'no_data_period',
+          'no_data_recovery_period',
+          'no_data_level',
+          'no_data_alert_name',
+          'notice',
+          'notice_type',
+          'notice_type_ids',
+          'notice_users',
+          'handlers',
+          'enable',
+          'enable_alerts',
+          'id',
+          'rule_id',
+          'group_id',
+        ].forEach((key) => {
+          delete editable[key];
+        });
+        const result = await post('/monitor/api/policy_group/save_rule_editor/', {
+          group_id: Number(policyGroupId),
+          rule_id: Number(ruleId),
+          ...editable,
+        });
+        message.success(
+          result?.closes_alerts
+            ? '已修改当前规则，未恢复告警会结束'
+            : '已修改当前规则，正在响的告警不结束'
+        );
+        goBack();
+        return;
+      }
       const url: string = ['builtIn', 'add'].includes(type)
         ? '/monitor/api/monitor_policy/'
         : `/monitor/api/monitor_policy/${detailId}/`;
@@ -1887,6 +2053,13 @@ const StrategyOperation = () => {
                 {detailName}
               </span>
             </span>
+          ) : isGroupRule ? (
+            <span>
+              修改规则 -{' '}
+              <span className="text-[var(--color-text-3)] text-[12px]">
+                {detailName}
+              </span>
+            </span>
           ) : ['builtIn', 'add'].includes(type) ? (
             t('monitor.events.createPolicy')
           ) : (
@@ -1916,6 +2089,7 @@ const StrategyOperation = () => {
                             onOpenInstModal={openInstModal}
                             onUnitChange={handleUnitChange}
                             isTrap={isTrap}
+                            groupLocked={isGroupRule}
                           />
                         </div>
                       ),
@@ -1946,6 +2120,8 @@ const StrategyOperation = () => {
                           unitList={unitList}
                           onCollectTypeChange={changeCollectType}
                           onMetricRowsChange={handleMetricRowsChange}
+                          onConditionCountChange={handleConditionCountChange}
+                          onSourceChange={handleConditionSourceChange}
                           onResultNameChange={setFormulaResultName}
                           onExpressionChange={setFormulaExpression}
                           onResultUnitChange={handleFormulaResultUnitChange}
@@ -1987,6 +2163,9 @@ const StrategyOperation = () => {
                               ?.unit || null
                           }
                           isFormulaMode={metricExpressionMode === 'formula'}
+                          metricExpressionMode={metricExpressionMode}
+                          metricRows={metricRows}
+                          onMetricRowsChange={handleMetricRowsChange}
                           period={period}
                           periodUnit={periodUnit}
                           compareMode={compareMode}
@@ -1997,10 +2176,12 @@ const StrategyOperation = () => {
                           forecastTargetUnit={forecastTargetUnit}
                           forecastLookback={forecastLookback}
                           metricLabel={
-                            metrics.find((item) => item.name === metric)
-                              ?.display_name ||
-                            metric ||
-                            null
+                            metricExpressionMode === 'formula'
+                              ? formulaResultName || null
+                              : metrics.find((item) => item.name === metric)
+                                ?.display_name ||
+                                metric ||
+                                null
                           }
                           monitorName={monitorName || undefined}
                           countPredicate={countPredicate}
@@ -2027,13 +2208,18 @@ const StrategyOperation = () => {
                           recoveryThreshold={recoveryThreshold}
                           onRecoveryThresholdChange={setRecoveryThreshold}
                           isTrap={isTrap}
+                          hideNoData={isGroupRule}
                         />
                       ),
                       status: 'process'
                     },
                     {
                       title: t('monitor.events.configureNotifications'),
-                      description: (
+                      description: isGroupRule ? (
+                        <div className="mb-6 text-xs leading-5 text-[var(--color-text-3)]">
+                          通知和处理人在策略组上设置，保存这条规则不会改它们。
+                        </div>
+                      ) : (
                         <NotificationForm
                           channelList={channelList}
                           userList={noticeUserList}
@@ -2050,6 +2236,11 @@ const StrategyOperation = () => {
               <VariablesTable
                 displayFields={currentMonitorObject?.display_fields}
                 groupBy={sanitizeGroupBy(metricRows[0]?.groupBy || groupBy)}
+                conditionRefs={
+                  metricExpressionMode === 'multi'
+                    ? metricRows.map((row) => row.ref)
+                    : []
+                }
                 onVariableSelect={(variable: string) => {
                   basicInfoFormRef.current?.insertVariable(variable);
                 }}
@@ -2098,6 +2289,16 @@ const StrategyOperation = () => {
                 onClick={() => void saveTemplate()}
               >
                 {t('monitor.events.saveTemplate', '保存模版')}
+              </Button>
+              <Button onClick={goBack}>{t('common.cancel')}</Button>
+            </>
+          ) : isGroupRule ? (
+            <>
+              <Button type="primary" loading={confirmLoading} onClick={createStrategy}>
+                {t('common.confirm')}
+              </Button>
+              <Button loading={dryRunLoading} onClick={runDryRun}>
+                {translateWithFallback('monitor.events.dryRun', '预检')}
               </Button>
               <Button onClick={goBack}>{t('common.cancel')}</Button>
             </>

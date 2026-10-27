@@ -1,3 +1,5 @@
+import json
+
 from django.db.models import Count, Q
 from rest_framework import viewsets
 from rest_framework.decorators import action
@@ -6,7 +8,6 @@ from apps.core.decorators.api_permission import HasPermission
 from apps.core.exceptions.base_app_exception import BaseAppException, ValidationAppException
 from apps.core.utils.current_team_scope import resolve_current_team_data_scope
 from apps.core.utils.web_utils import WebUtils
-from apps.system_mgmt.utils.operation_log_utils import log_operation
 from apps.monitor.models import (
     MonitorInstance,
     MonitorInstanceOrganization,
@@ -16,8 +17,10 @@ from apps.monitor.models import (
     PolicyGroupMembership,
     PolicyTemplate,
 )
-from apps.monitor.services.policy_group import PolicyGroupService
+from apps.monitor.serializers.monitor_policy import MonitorPolicySerializer
+from apps.monitor.services.policy_group import PolicyGroupService, group_detection_state, no_data_carrier_rule_ids
 from apps.monitor.utils.pagination import parse_page_params
+from apps.system_mgmt.utils.operation_log_utils import log_operation
 
 
 def _operator(scope):
@@ -25,11 +28,7 @@ def _operator(scope):
 
 
 def _group_in_scope(scope, group_id):
-    group = (
-        PolicyGroup.objects.filter(id=group_id, organization=int(scope.current_team))
-        .select_related("monitor_object")
-        .first()
-    )
+    group = PolicyGroup.objects.filter(id=group_id, organization=int(scope.current_team)).select_related("monitor_object").first()
     if group is None:
         raise BaseAppException("策略组不存在")
     return group
@@ -47,11 +46,18 @@ def _optional_positive_id(raw, param_name):
     return value
 
 
-def _serialize_rule(rule, metric_names=None, alert_counts=None):
+def _serialize_rule(rule, metric_names=None, alert_counts=None, no_data_carrier=False):
     metric_id = PolicyGroupService.metric_id_for_policy(rule.policy)
     metric_name = ""
     if metric_id and metric_names is not None:
         metric_name = metric_names.get(metric_id) or ""
+    metric_name_list = []
+    if metric_names is not None:
+        metric_name_list = [metric_names[item] for item in PolicyGroupService.metric_ids_for_policy(rule.policy) if item in metric_names]
+    query = rule.policy.query_condition if isinstance(rule.policy.query_condition, dict) else {}
+    condition_thresholds = {}
+    if query.get("type") == "multi":
+        condition_thresholds = {item.get("ref"): item.get("threshold") or [] for item in query.get("queries") or [] if isinstance(item, dict)}
     plugin = rule.plugin
     counts = alert_counts or {}
     return {
@@ -61,7 +67,15 @@ def _serialize_rule(rule, metric_names=None, alert_counts=None):
         "plugin_name": plugin.name,
         "collect_type": plugin.collect_type or rule.policy.collect_type or "",
         "metric_name": metric_name,
+        "metric_names": metric_name_list,
+        "query_type": query.get("type") or "",
+        "condition_thresholds": condition_thresholds,
         "threshold": rule.policy.threshold,
+        "alert_name": rule.policy.alert_name or "",
+        "trigger_count": rule.policy.trigger_count,
+        "recovery_condition": rule.policy.recovery_condition,
+        "recovery_threshold": rule.policy.recovery_threshold or {},
+        "no_data_carrier": bool(no_data_carrier),
         "policy_id": rule.policy_id,
         "open_alert_count": counts.get(rule.policy_id, 0),
     }
@@ -72,14 +86,14 @@ def _serialize_group(group, default_id, metric_names=None, plugin_id=None, colle
     if member_count is None:
         member_count = group.memberships.filter(state=PolicyGroupMembership.STATE_MEMBER).count()
     loaded_rules = list(group.rules.select_related("plugin", "policy"))
-    visible_rules = PolicyGroupService.filter_rules_for_access(
-        loaded_rules, plugin_id=plugin_id, collect_type=collect_type
-    )
-    rules = [_serialize_rule(rule, metric_names, alert_counts) for rule in visible_rules]
+    visible_rules = PolicyGroupService.filter_rules_for_access(loaded_rules, plugin_id=plugin_id, collect_type=collect_type)
+    carrier_ids = no_data_carrier_rule_ids(loaded_rules)
+    rules = [_serialize_rule(rule, metric_names, alert_counts, no_data_carrier=rule.id in carrier_ids) for rule in visible_rules]
     counts = alert_counts or {}
     open_alert_count = sum(counts.get(rule.policy_id, 0) for rule in loaded_rules)
     notice = _group_notice(loaded_rules)
     enable = _group_enable(loaded_rules)
+    detection = group_detection_state(loaded_rules)
     return {
         "id": group.id,
         "name": group.name,
@@ -91,13 +105,26 @@ def _serialize_group(group, default_id, metric_names=None, plugin_id=None, colle
         "rules": rules,
         **notice,
         **enable,
+        **detection,
     }
+
+
+def _handler_ids(policy):
+    return tuple(str(item) for item in (policy.handlers or []))
 
 
 def _group_notice(rules):
     policies = [rule.policy for rule in rules]
     if not policies:
-        return {"notice": False, "notice_type": "", "notice_type_ids": [], "notice_users": [], "notice_uniform": True}
+        return {
+            "notice": False,
+            "notice_type": "",
+            "notice_type_ids": [],
+            "notice_users": [],
+            "notice_uniform": True,
+            "handlers": [],
+            "handlers_uniform": True,
+        }
 
     def snapshot(policy):
         return (
@@ -108,15 +135,28 @@ def _group_notice(rules):
         )
 
     first = policies[0]
-    uniform = all(snapshot(policy) == snapshot(first) for policy in policies)
-    if not uniform:
-        return {"notice": False, "notice_type": "", "notice_type_ids": [], "notice_users": [], "notice_uniform": False}
+    notice_uniform = all(snapshot(policy) == snapshot(first) for policy in policies)
+    handlers_uniform = all(_handler_ids(policy) == _handler_ids(first) for policy in policies)
+    if notice_uniform:
+        notice = {
+            "notice": bool(first.notice),
+            "notice_type": first.notice_type or "",
+            "notice_type_ids": list(first.notice_type_ids or []),
+            "notice_users": list(first.notice_users or []),
+            "notice_uniform": True,
+        }
+    else:
+        notice = {
+            "notice": False,
+            "notice_type": "",
+            "notice_type_ids": [],
+            "notice_users": [],
+            "notice_uniform": False,
+        }
     return {
-        "notice": bool(first.notice),
-        "notice_type": first.notice_type or "",
-        "notice_type_ids": list(first.notice_type_ids or []),
-        "notice_users": list(first.notice_users or []),
-        "notice_uniform": True,
+        **notice,
+        "handlers": list(first.handlers or []) if handlers_uniform else [],
+        "handlers_uniform": handlers_uniform,
     }
 
 
@@ -164,10 +204,10 @@ class PolicyGroupViewSet(viewsets.ViewSet):
             monitor_object = MonitorObject.objects.filter(id=object_id).first()
             if monitor_object is not None:
                 PolicyGroupService.ensure_default(organization=organization, monitor_object=monitor_object, operator=_operator(scope))
-        queryset = PolicyGroup.objects.filter(organization=organization).prefetch_related(
-            "rules__plugin", "rules__policy"
-        ).annotate(
-            joined_member_count=Count("memberships", filter=Q(memberships__state=PolicyGroupMembership.STATE_MEMBER))
+        queryset = (
+            PolicyGroup.objects.filter(organization=organization)
+            .prefetch_related("rules__plugin", "rules__policy")
+            .annotate(joined_member_count=Count("memberships", filter=Q(memberships__state=PolicyGroupMembership.STATE_MEMBER)))
         )
         if object_id not in (None, ""):
             queryset = queryset.filter(monitor_object_id=object_id)
@@ -192,9 +232,7 @@ class PolicyGroupViewSet(viewsets.ViewSet):
                     "items": _serialize_groups(groups, default_id, plugin_id=plugin_id, collect_type=collect_type),
                 }
             )
-        return WebUtils.response_success(
-            _serialize_groups(list(queryset), default_id, plugin_id=plugin_id, collect_type=collect_type)
-        )
+        return WebUtils.response_success(_serialize_groups(list(queryset), default_id, plugin_id=plugin_id, collect_type=collect_type))
 
     @action(methods=["post"], detail=False, url_path="create_from_templates")
     @HasPermission("strategy_list-Edit")
@@ -265,18 +303,31 @@ class PolicyGroupViewSet(viewsets.ViewSet):
     def members(self, request):
         scope = resolve_current_team_data_scope(request)
         group = _group_in_scope(scope, request.query_params.get("group_id"))
-        rows = []
-        memberships = group.memberships.filter(state=PolicyGroupMembership.STATE_MEMBER).select_related("monitor_instance")
-        for membership in memberships:
-            instance = membership.monitor_instance
-            rows.append(
-                {
-                    "instance_id": instance.id,
-                    "name": instance.name,
-                    "state": membership.state,
-                    "legacy_policies": _legacy_policies(instance),
-                }
-            )
+        memberships = list(group.memberships.filter(state=PolicyGroupMembership.STATE_MEMBER).select_related("monitor_instance"))
+        rows = [
+            {
+                "instance_id": membership.monitor_instance.id,
+                "name": membership.monitor_instance.name,
+            }
+            for membership in memberships
+        ]
+        return WebUtils.response_success(rows)
+
+    @action(methods=["get"], detail=False)
+    def instance_groups(self, request):
+        scope = resolve_current_team_data_scope(request)
+        raw = request.query_params.get("instance_ids") or "[]"
+        try:
+            instance_ids = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            raise BaseAppException("instance_ids 无效")
+        if not isinstance(instance_ids, list):
+            raise BaseAppException("instance_ids 无效")
+        instance_ids = [str(item) for item in instance_ids if str(item).strip()]
+        if len(instance_ids) > 100:
+            raise BaseAppException("一次最多查询 100 个实例")
+        found = PolicyGroupService.member_group_names(instance_ids, int(scope.current_team))
+        rows = [{"instance_id": instance_id, "group_id": item["id"], "group_name": item["name"]} for instance_id, item in found.items()]
         return WebUtils.response_success(rows)
 
     @action(methods=["get"], detail=False)
@@ -317,21 +368,84 @@ class PolicyGroupViewSet(viewsets.ViewSet):
         rule = group.rules.select_related("policy").filter(id=request.data.get("rule_id")).first()
         if rule is None:
             raise BaseAppException("规则不存在")
-        PolicyGroupService.update_rule(
-            rule,
-            threshold=request.data.get("threshold", rule.policy.threshold),
+        update_kwargs = {"operator": _operator(scope)}
+        if "condition_thresholds" in request.data:
+            update_kwargs["condition_thresholds"] = request.data.get("condition_thresholds")
+        elif "threshold" in request.data:
+            update_kwargs["threshold"] = request.data.get("threshold")
+        for field in ("trigger_count", "recovery_condition", "recovery_threshold", "alert_name"):
+            if field in request.data:
+                update_kwargs[field] = request.data.get(field)
+        PolicyGroupService.update_rule(rule, **update_kwargs)
+        log_operation(
+            request,
+            "update",
+            "monitor",
+            "修改策略组规则",
+            target_type="policy_group",
+            target_id=group.id,
+            detail={"group_id": group.id, "rule_id": rule.id, "policy_id": rule.policy_id},
+        )
+        return WebUtils.response_success({"id": rule.id})
+
+    @action(methods=["get"], detail=False, url_path="rule_editor")
+    def rule_editor(self, request):
+        scope = resolve_current_team_data_scope(request)
+        group = _group_in_scope(scope, request.query_params.get("group_id"))
+        rule = group.rules.select_related("policy").filter(id=request.query_params.get("rule_id")).first()
+        if rule is None:
+            raise BaseAppException("规则不存在")
+        data = MonitorPolicySerializer(rule.policy).data
+        data["name"] = rule.name
+        data["rule_id"] = rule.id
+        data["group_id"] = group.id
+        return WebUtils.response_success(data)
+
+    @action(methods=["post"], detail=False, url_path="save_rule_editor")
+    @HasPermission("strategy_list-Edit")
+    def save_rule_editor(self, request):
+        scope = resolve_current_team_data_scope(request)
+        group = _group_in_scope(scope, request.data.get("group_id"))
+        rule = group.rules.select_related("policy").filter(id=request.data.get("rule_id")).first()
+        if rule is None:
+            raise BaseAppException("规则不存在")
+        closes_alerts = PolicyGroupService.apply_rule_editor(rule, request.data, operator=_operator(scope))
+        log_operation(
+            request,
+            "update",
+            "monitor",
+            "修改策略组规则",
+            target_type="policy_group",
+            target_id=group.id,
+            detail={"group_id": group.id, "rule_id": rule.id, "policy_id": rule.policy_id},
+        )
+        return WebUtils.response_success({"id": rule.id, "closes_alerts": closes_alerts})
+
+    @action(methods=["post"], detail=False, url_path="update_detection")
+    @HasPermission("strategy_list-Edit")
+    def update_detection(self, request):
+        scope = resolve_current_team_data_scope(request)
+        group = _group_in_scope(scope, request.data.get("group_id"))
+        has_schedule = "schedule" in request.data
+        has_no_data = "no_data" in request.data
+        if not has_schedule and not has_no_data:
+            raise ValidationAppException("请至少设置检测频率或无数据告警")
+        PolicyGroupService.update_detection(
+            group,
+            schedule=request.data.get("schedule") if has_schedule else None,
+            no_data=request.data.get("no_data") if has_no_data else None,
             operator=_operator(scope),
         )
         log_operation(
             request,
             "update",
             "monitor",
-            "修改策略组规则阈值",
+            "修改策略组检测配置",
             target_type="policy_group",
             target_id=group.id,
-            detail={"group_id": group.id, "rule_id": rule.id, "policy_id": rule.policy_id},
+            detail={"group_id": group.id, "schedule": has_schedule, "no_data": has_no_data},
         )
-        return WebUtils.response_success({"id": rule.id})
+        return WebUtils.response_success({"id": group.id})
 
     @action(methods=["post"], detail=False, url_path="update_notice")
     @HasPermission("strategy_list-Edit")
@@ -342,6 +456,12 @@ class PolicyGroupViewSet(viewsets.ViewSet):
         raw_users = request.data.get("notice_users") or []
         if not isinstance(raw_ids, list) or not isinstance(raw_users, list):
             raise BaseAppException("通知方式不正确")
+        if "handlers" in request.data:
+            raw_handlers = request.data.get("handlers")
+            if not isinstance(raw_handlers, list):
+                raise ValidationAppException("处理人不正确")
+        else:
+            raw_handlers = None
         try:
             notice_type_ids = [int(item) for item in raw_ids]
         except (TypeError, ValueError):
@@ -352,6 +472,7 @@ class PolicyGroupViewSet(viewsets.ViewSet):
             notice_type=str(request.data.get("notice_type") or ""),
             notice_type_ids=notice_type_ids,
             notice_users=raw_users,
+            handlers=raw_handlers,
             operator=_operator(scope),
         )
         return WebUtils.response_success({"id": group.id})

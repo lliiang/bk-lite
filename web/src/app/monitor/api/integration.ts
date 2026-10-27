@@ -47,6 +47,11 @@ const useIntegrationApi = () => {
           () => demoPolicyGroups({ ...params, create_default })
         );
       },
+      getPolicyGroupInstanceGroups: async (instanceIds: string[]) => {
+        return await get(`/monitor/api/policy_group/instance_groups/`, {
+          params: { instance_ids: JSON.stringify(instanceIds) },
+        });
+      },
       getPolicyGroupMembers: async (groupId: number | string) => {
         return await withMonitorUiDemoFallback(
           () => get(`/monitor/api/policy_group/members/`, {
@@ -75,8 +80,26 @@ const useIntegrationApi = () => {
         group_id: number;
         rule_id: number;
         threshold?: unknown;
+        condition_thresholds?: Record<string, unknown>;
+        trigger_count?: number;
+        recovery_condition?: number;
+        recovery_threshold?: { method?: string; value?: number | null } | Record<string, never>;
+        alert_name?: string;
       }) => {
         return await post(`/monitor/api/policy_group/update_rule/`, payload);
+      },
+      updatePolicyGroupDetection: async (payload: {
+        group_id: number;
+        schedule?: { type: string; value: number };
+        no_data?: {
+          enabled: boolean;
+          period?: { type: string; value: number };
+          level?: string;
+          alert_name?: string;
+          recovery_period?: { type: string; value: number };
+        };
+      }) => {
+        return await post(`/monitor/api/policy_group/update_detection/`, payload);
       },
       updatePolicyGroupNotice: async (payload: {
         group_id: number;
@@ -84,6 +107,7 @@ const useIntegrationApi = () => {
         notice_type?: string;
         notice_type_ids?: number[];
         notice_users?: Array<string | number>;
+        handlers?: Array<string | number>;
       }) => {
         return await post(`/monitor/api/policy_group/update_notice/`, payload);
       },
@@ -148,6 +172,7 @@ const useIntegrationApi = () => {
         page?: number;
         page_size?: number;
         is_active?: boolean;
+        keyword?: string;
         monitor_plugin_id?: string | number;
       }) => {
         return await post('/monitor/api/node_mgmt/nodes/', data);

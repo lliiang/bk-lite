@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useCallback } from 'react';
-import { LinkOutlined } from '@ant-design/icons';
+import { ExportOutlined } from '@ant-design/icons';
 import { Button, Tooltip, message } from 'antd';
 
 import { useFilterTemplateSnapshot } from '@/app/ops-analysis/context/filterTemplate';
@@ -66,9 +66,6 @@ export const useWidgetDataLink = (config?: object | null) => {
   const hoverHint = showDataLinkHint
     ? t('dashboard.interactionHoverHint', '点击打开：{name}', { name: hintName })
     : undefined;
-  const contextHint = showDataLinkHint
-    ? t('dashboard.interactionContextHint', '右键打开链接')
-    : '';
   const openPoint = useCallback((point?: ChartLinkPoint) => {
     if (!active || !point) return;
     open(point);
@@ -85,7 +82,6 @@ export const useWidgetDataLink = (config?: object | null) => {
     showDataLinkHint,
     chartTooltipHint,
     hoverHint,
-    contextHint,
   };
 };
 
@@ -93,12 +89,15 @@ interface InteractionTitleIconProps {
   config?: ValueConfig | null;
   floating?: boolean;
   variant?: 'default' | 'screen' | 'text';
+  /** 拓扑节点跟标题色走，仪表盘和报表继续用次级文字色。 */
+  color?: string;
 }
 
 const InteractionTitleIcon: React.FC<InteractionTitleIconProps> = ({
   config,
   floating = false,
   variant = 'default',
+  color,
 }) => {
   const { t } = useTranslation();
   const { link, surface, open } = useOpenInteractionLink(config);
@@ -108,13 +107,20 @@ const InteractionTitleIcon: React.FC<InteractionTitleIconProps> = ({
   const hint = shouldNavigateInteraction(surface)
     ? label
     : t('dashboard.interactionViewModeOnly', '查看模式下可跳转');
+  const toneClass = color
+    ? ''
+    : 'text-(--color-text-3) transition-colors hover:text-(--color-primary)';
+  const hoverRevealClass = 'pointer-events-none opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100';
   const layoutClass = variant === 'screen' || variant === 'text'
     ? `screen-widget-frame__title-link${variant === 'text' ? ' screen-text-item__title-link' : ''}`
-    : `inline-flex shrink-0 cursor-pointer items-center justify-center text-(--color-text-3) transition-colors hover:text-(--color-primary) ${
+    : [
+      'inline-flex shrink-0 cursor-pointer items-center justify-center',
+      hoverRevealClass,
+      toneClass,
       floating
         ? 'absolute right-2 top-2 z-20 h-6 w-6 rounded-full bg-(--color-bg-1)/80 shadow-sm'
-        : 'h-5 w-5 rounded hover:bg-(--color-fill-2)'
-    }`;
+        : 'h-5 w-0 min-w-0 -ml-2 -mr-2 overflow-hidden rounded border-0 bg-transparent p-0 group-hover:ml-0 group-hover:mr-0 group-hover:w-5 group-hover:overflow-visible group-focus-within:ml-0 group-focus-within:mr-0 group-focus-within:w-5 group-focus-within:overflow-visible hover:bg-(--color-fill-2)',
+    ].filter(Boolean).join(' ');
 
   return (
     <Tooltip title={hint} mouseEnterDelay={0}>
@@ -123,6 +129,7 @@ const InteractionTitleIcon: React.FC<InteractionTitleIconProps> = ({
         data-export-hidden="true"
         aria-label={label}
         className={`no-drag ${layoutClass}`}
+        style={color ? { color } : undefined}
         onClick={(event) => {
           event.preventDefault();
           if (shouldNavigateInteraction(surface)) {
@@ -133,7 +140,7 @@ const InteractionTitleIcon: React.FC<InteractionTitleIconProps> = ({
           if (variant !== 'text') event.stopPropagation();
         }}
       >
-        <LinkOutlined aria-hidden />
+        <ExportOutlined aria-hidden />
       </button>
     </Tooltip>
   );

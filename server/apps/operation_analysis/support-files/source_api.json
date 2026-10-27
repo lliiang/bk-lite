@@ -67,6 +67,48 @@
         "value": 10080,
         "alias_name": "时间范围",
         "filterType": "filter"
+      },
+      {
+        "name": "organization",
+        "type": "string",
+        "value": "",
+        "alias_name": "组织",
+        "filterType": "filter",
+        "inputConfig": {
+          "control": "organization"
+        }
+      }
+    ]
+  },
+  {
+    "key": "告警新增与关闭趋势::alert/get_alert_open_close_trend",
+    "name": "告警新增与关闭趋势",
+    "desc": "跟随时间范围，按自动粒度返回新增告警数（created_at）和关闭告警数（updated_at，含全部关闭状态）",
+    "rest_api": "alert/get_alert_open_close_trend",
+    "tag": [
+      "alerts"
+    ],
+    "chart_type": [
+      "line",
+      "bar"
+    ],
+    "params": [
+      {
+        "name": "time",
+        "type": "timeRange",
+        "value": 10080,
+        "alias_name": "时间范围",
+        "filterType": "filter"
+      },
+      {
+        "name": "organization",
+        "type": "string",
+        "value": "",
+        "alias_name": "组织",
+        "filterType": "filter",
+        "inputConfig": {
+          "control": "organization"
+        }
       }
     ]
   },
@@ -307,10 +349,10 @@
 {
     "key": "主机资源快照::monitor/get_host_resource_snapshot",
     "name": "主机资源快照",
-    "desc": "按所选主机返回数量、CPU/内存/磁盘均值与最高值；未选主机不退化为全量",
+    "desc": "按主机范围返回数量、CPU/内存/磁盘均值与最高值。范围为空或非法时按所选主机，未选主机不退化为全量。不填时间返回近实时快照（含最高值）；填写时间后，全部授权主机或已选主机改为窗口均值，最高值留空。",
     "rest_api": "monitor/get_host_resource_snapshot",
     "tag": ["monitor"],
-    "chart_type": ["single", "multiValue", "table"],
+    "chart_type": ["single", "multiValue", "table", "gauge", "topN"],
     "params": [
       {
         "name": "instance_ids",
@@ -327,6 +369,42 @@
             "valueField": "instance_id",
             "labelField": "display_name"
           }
+        }
+      },
+      {
+        "name": "scope",
+        "type": "string",
+        "value": "",
+        "alias_name": "主机范围",
+        "filterType": "params",
+        "desc": "所选主机只看 instance_ids；全部授权主机忽略 instance_ids。空值与非法值都按所选主机。",
+        "inputConfig": {
+          "control": "select",
+          "optionsSource": {
+            "type": "static",
+            "staticItems": [
+              {"label": "所选主机", "value": "selected"},
+              {"label": "全部授权主机", "value": "all_authorized"}
+            ]
+          }
+        }
+      },
+      {
+        "name": "time",
+        "type": "timeRange",
+        "value": "",
+        "alias_name": "时间范围",
+        "filterType": "filter",
+        "desc": "可选。不填走近实时快照（含最高值）；填写后所选主机与全部授权主机都改为窗口均值，最高值留空。"
+      },
+      {
+        "name": "organization",
+        "type": "string",
+        "value": "",
+        "alias_name": "组织",
+        "filterType": "filter",
+        "inputConfig": {
+          "control": "organization"
         }
       }
     ],
@@ -413,6 +491,18 @@
             "description": "告警描述内容"
         },
         {
+            "key": "value",
+            "title": "当前值",
+            "value_type": "number",
+            "description": "触发时记录的最高告警值"
+        },
+        {
+            "key": "metric_name",
+            "title": "监控项",
+            "value_type": "string",
+            "description": "策略关联指标的展示名；公式或组合策略使用结果名"
+        },
+        {
             "key": "start_event_time",
             "title": "开始时间",
             "value_type": "string",
@@ -439,6 +529,16 @@
             "value": 10,
             "alias_name": "返回条数",
             "filterType": "fixed"
+        },
+        {
+            "name": "organization",
+            "type": "string",
+            "value": "",
+            "alias_name": "组织",
+            "filterType": "filter",
+            "inputConfig": {
+                "control": "organization"
+            }
         },
         {
             "name": "level",
@@ -571,7 +671,8 @@
         "monitor"
     ],
     "chart_type": [
-        "single"
+        "single",
+        "pie"
     ],
     "params": [
         {
@@ -1401,6 +1502,208 @@
       {"key": "zombie_whitelist", "title": "僵尸机白名单", "value_type": "string"},
       {"key": "inst_uuid", "title": "主机UUID", "value_type": "string"},
       {"key": "monitor_id", "title": "监控实例ID", "value_type": "string"}
+    ]
+},
+{
+    "key": "云区域列表::cmdb/get_cloud_region_options",
+    "name": "云区域列表（选项）",
+    "desc": "节点管理中的云区域，供参数下拉使用，本身不直接出图",
+    "rest_api": "cmdb/get_cloud_region_options",
+    "tag": ["cmdb"],
+    "chart_type": [],
+    "params": [],
+    "field_schema": [
+        {"key": "id", "title": "云区域 ID", "value_type": "number", "description": "主机 cloud 字段保存的云区域 ID"},
+        {"key": "name", "title": "云区域名称", "value_type": "string", "description": "云区域显示名称"}
+    ]
+},
+{
+    "key": "模型关联列表::cmdb/get_model_association_options",
+    "name": "模型关联列表（选项）",
+    "desc": "一端为指定模型的业务关联。值是模型关联 ID",
+    "rest_api": "cmdb/get_model_association_options",
+    "tag": ["cmdb"],
+    "chart_type": [],
+    "params": [
+        {
+            "name": "model_id",
+            "type": "string",
+            "value": "host",
+            "alias_name": "模型",
+            "filterType": "fixed",
+            "required": true
+        }
+    ],
+    "field_schema": [
+        {"key": "model_asst_id", "title": "模型关联 ID", "value_type": "string", "description": "关联定义标识"},
+        {"key": "label", "title": "关联", "value_type": "string", "description": "源模型、关系名称和目标模型"},
+        {"key": "src_model_id", "title": "源模型", "value_type": "string", "description": "关联源模型标识"},
+        {"key": "dst_model_id", "title": "目标模型", "value_type": "string", "description": "关联目标模型标识"},
+        {"key": "asst_name", "title": "关系名称", "value_type": "string", "description": "关系显示名称"}
+    ]
+},
+{
+    "key": "分类实例合计::cmdb/get_classification_instance_counts",
+    "name": "分类实例合计",
+    "desc": "按所选模型分类返回可见实例总数，顺序与选择一致，数量为 0 也返回",
+    "rest_api": "cmdb/get_classification_instance_counts",
+    "tag": ["cmdb"],
+    "chart_type": ["single", "multiValue", "bar", "topN"],
+    "params": [
+        {
+            "name": "classification_ids",
+            "type": "string",
+            "value": [],
+            "alias_name": "模型分类",
+            "filterType": "params",
+            "required": true,
+            "inputConfig": {
+                "control": "select",
+                "multiple": true,
+                "optionsSource": {
+                    "type": "dynamic",
+                    "sourceRef": {"type": "rest_api", "value": "cmdb/get_model_classification_options"},
+                    "valueField": "classification_id",
+                    "labelField": "classification_name"
+                }
+            }
+        },
+        {
+            "name": "all_visible",
+            "type": "string",
+            "value": "",
+            "alias_name": "全部可见分类",
+            "filterType": "params"
+        },
+        {
+            "name": "organization",
+            "type": "string",
+            "value": "",
+            "alias_name": "组织",
+            "filterType": "filter",
+            "inputConfig": {
+                "control": "organization"
+            }
+        }
+    ],
+    "field_schema": [
+        {"key": "classification_id", "title": "分类 ID", "value_type": "string", "description": "模型分类标识"},
+        {"key": "classification_name", "title": "分类名称", "value_type": "string", "description": "当前语言下的分类名称"},
+        {"key": "label", "title": "分类", "value_type": "string", "description": "与分类名称相同，供多值图使用"},
+        {"key": "value", "title": "实例数量", "value_type": "number", "description": "该分类下当前可见模型的实例总数"}
+    ]
+},
+{
+    "key": "云区域资源分布::cmdb/get_cloud_region_resource_counts",
+    "name": "云区域资源分布",
+    "desc": "统计所选云区域中的主机、沿模型关联找到的实例，以及带标签且没有主机关联的实例。按实例去重后按模型计数",
+    "rest_api": "cmdb/get_cloud_region_resource_counts",
+    "tag": ["cmdb"],
+    "chart_type": ["multiValue"],
+    "params": [
+        {
+            "name": "cloud_region_ids",
+            "type": "string",
+            "value": [],
+            "alias_name": "云区域",
+            "filterType": "params",
+            "required": true,
+            "inputConfig": {
+                "control": "select",
+                "multiple": true,
+                "optionsSource": {
+                    "type": "dynamic",
+                    "sourceRef": {"type": "rest_api", "value": "cmdb/get_cloud_region_options"},
+                    "valueField": "id",
+                    "labelField": "name"
+                }
+            }
+        },
+        {
+            "name": "model_asst_ids",
+            "type": "string",
+            "value": [],
+            "alias_name": "模型关联",
+            "filterType": "params",
+            "required": true,
+            "inputConfig": {
+                "control": "select",
+                "multiple": true,
+                "picker": "table",
+                "optionsSource": {
+                    "type": "dynamic",
+                    "sourceRef": {"type": "rest_api", "value": "cmdb/get_model_association_options"},
+                    "valueField": "model_asst_id",
+                    "labelField": "label"
+                }
+            }
+        },
+        {
+            "name": "supplement_tag_key",
+            "type": "string",
+            "value": "",
+            "alias_name": "补充标签键",
+            "filterType": "params"
+        },
+        {
+            "name": "supplement_tag_value",
+            "type": "string",
+            "value": "",
+            "alias_name": "补充标签值",
+            "filterType": "params"
+        }
+    ],
+    "field_schema": [
+        {"key": "model_id", "title": "模型标识", "value_type": "string", "description": "模型 ID"},
+        {"key": "model_name", "title": "模型名称", "value_type": "string", "description": "当前语言下的模型名称"},
+        {"key": "label", "title": "模型", "value_type": "string", "description": "与模型名称相同，供多值图使用"},
+        {"key": "value", "title": "实例数量", "value_type": "number", "description": "去重后的实例数量，配置过的模型为 0 也返回"}
+    ]
+},
+{
+    "key": "关联告警汇总::monitor/get_cmdb_relation_alert_aggregation",
+    "name": "CMDB 关联告警汇总",
+    "desc": "按指定模型关联，统计源实例总数，以及其中有活跃监控告警和无活跃监控告警的数量",
+    "rest_api": "monitor/get_cmdb_relation_alert_aggregation",
+    "tag": ["monitor"],
+    "chart_type": ["single", "pie"],
+    "params": [
+        {"name": "view", "type": "string", "value": "summary", "alias_name": "视图", "filterType": "fixed"},
+        {"name": "model_id", "type": "string", "value": "", "alias_name": "源模型", "filterType": "params", "required": true},
+        {"name": "model_asst_id", "type": "string", "value": "", "alias_name": "模型关联", "filterType": "params", "required": true},
+        {"name": "peer_model_id", "type": "string", "value": "host", "alias_name": "对端模型", "filterType": "params"},
+        {"name": "organization", "type": "string", "value": "", "alias_name": "组织", "filterType": "filter", "inputConfig": {"control": "organization"}}
+    ],
+    "field_schema": [
+        {"key": "total_count", "title": "源实例总数", "value_type": "number", "description": "当前可见的源模型实例数"},
+        {"key": "with_alert_count", "title": "有关联告警", "value_type": "number", "description": "至少一台授权对端主机存在活跃监控告警的源实例数"},
+        {"key": "without_alert_count", "title": "无关联告警", "value_type": "number", "description": "没有授权对端主机或对端没有活跃监控告警的源实例数"},
+        {"key": "with_alert_share", "title": "有关联告警占比", "value_type": "string", "description": "有关联告警的源实例占源实例总数的百分比，形如 21.1%"},
+        {"key": "without_alert_share", "title": "无关联告警占比", "value_type": "string", "description": "与有关联告警占比互补；没有源实例时为 0.0%"}
+    ]
+},
+{
+    "key": "关联告警 TOP::monitor/get_cmdb_relation_alert_aggregation",
+    "name": "CMDB 关联告警 TOP",
+    "desc": "按指定模型关联，返回授权对端活跃监控告警数最多的源实例",
+    "rest_api": "monitor/get_cmdb_relation_alert_aggregation",
+    "tag": ["monitor"],
+    "chart_type": ["topN", "table"],
+    "params": [
+        {"name": "view", "type": "string", "value": "top", "alias_name": "视图", "filterType": "fixed"},
+        {"name": "model_id", "type": "string", "value": "", "alias_name": "源模型", "filterType": "params", "required": true},
+        {"name": "model_asst_id", "type": "string", "value": "", "alias_name": "模型关联", "filterType": "params", "required": true},
+        {"name": "peer_model_id", "type": "string", "value": "host", "alias_name": "对端模型", "filterType": "params"},
+        {"name": "limit", "type": "number", "value": 5, "alias_name": "返回条数", "filterType": "params"},
+        {"name": "organization", "type": "string", "value": "", "alias_name": "组织", "filterType": "filter", "inputConfig": {"control": "organization"}}
+    ],
+    "field_schema": [
+        {"key": "name", "title": "实例名称", "value_type": "string", "description": "源实例名称"},
+        {"key": "value", "title": "告警数", "value_type": "number", "description": "授权对端主机上的活跃监控告警数"},
+        {"key": "inst_uuid", "title": "实例标识", "value_type": "string", "description": "源实例 UUID"},
+        {"key": "host_count", "title": "关联主机数", "value_type": "number", "description": "通过该关联展开的对端主机数"},
+        {"key": "alert_count", "title": "告警数", "value_type": "number", "description": "与 value 相同，供表格列使用"},
+        {"key": "share", "title": "占比", "value_type": "string", "description": "该实例告警数占全部源实例告警数的百分比，形如 21.1%"}
     ]
 }
 ]

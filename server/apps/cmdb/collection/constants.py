@@ -106,12 +106,23 @@ VMWARE_COLLECT_MAP = {
     "vmware_esxi_info_gauge": "vmware_esxi",
 }
 
+HYPERV_CLUSTER = ["hyperv_host_info_gauge", "hyperv_vm_info_gauge"]
+
+HYPERV_COLLECT_MAP = {
+    "hyperv_host_info_gauge": "hyperv_host",
+    "hyperv_vm_info_gauge": "hyperv_vm",
+    "hyperv_host_info": "hyperv_host",
+    "hyperv_vm_info": "hyperv_vm",
+}
+
 # "network_interfaces_info_gauge"
 NETWORK_COLLECT = [
     "network_system_info_gauge",
     "network_interfaces_info_gauge",
     "network_info_gauge",
+    "network_sn_info_gauge",
 ]
+NETWORK_SN_METRICS = frozenset({"network_sn_info_gauge", "network_sn_info"})
 NETWORK_INTERFACES_RELATIONS = "network_topo_info_gauge"
 NETWORK_TOPOLOGY_FACTS = "network_topology_facts_info_gauge"
 

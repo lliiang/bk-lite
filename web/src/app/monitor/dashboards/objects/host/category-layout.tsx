@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Tabs } from 'antd';
 import useMonitorApi from '@/app/monitor/api';
 import {
@@ -17,8 +17,10 @@ import DiskPane from './layered/disk-pane';
 import FlatProcessSplit from './layered/flat-process-split';
 import NetworkPane from './layered/network-pane';
 import { hostAlertRailEvents, type HostAlertRailEvent } from './layered/events-rail';
+import { ProTimeWindowProvider } from './layered/pro-time-window';
+import { selectProChartWindow } from '../../shared/utils/pro-chart-window';
 import HostAlertDrawer from './layered/host-alert-drawer';
-import { activeHostAlertParams } from './layered/host-alert-list';
+import { overviewHostAlertParams } from './layered/host-alert-list';
 import OverviewPane from './layered/overview-pane';
 import SystemPane from './layered/system-pane';
 import { latestNumber, latestPreferCount, resolveMemoryUsage } from './layered/readings';
@@ -45,6 +47,16 @@ const TabLevelMark = ({ level }: { level: TabAlertLevel }) => {
 
 const EMPTY_ENTITY: EntityLoadState = { status: 'idle', byMetric: {} };
 
+/** 健康概览主值。这些序列或磁盘维度还在飞时，整行显示「加载中」，不用 `--` 占位。 */
+const HOST_OVERVIEW_KPI_METRICS = [
+  'cpu_usage_total',
+  'mem_used_percent',
+  'mem_available',
+  'mem_total',
+  'system_uptime',
+  'system_load1'
+] as const;
+
 const maxRowValue = (rows: EntityTableRow[], key: string) => {
   let best: number | null = null;
   for (const row of rows) {
@@ -62,9 +74,15 @@ const busiestFirst = (rows: EntityTableRow[]) => [...rows].sort((left, right) =>
   return score(right) - score(left);
 });
 
-const usePinnedRow = (rows: EntityTableRow[]) => {
+const usePinnedRow = (rows: EntityTableRow[], identity: string) => {
   const [selectedKey, setSelectedKey] = useState('');
   const [pendingKey, setPendingKey] = useState('');
+  const [seenIdentity, setSeenIdentity] = useState(identity);
+  if (identity !== seenIdentity) {
+    setSeenIdentity(identity);
+    setSelectedKey('');
+    setPendingKey('');
+  }
   useEffect(() => {
     if (!rows.length) return;
     if (pendingKey && rows.some((row) => row.key === pendingKey)) {
@@ -81,11 +99,23 @@ const usePinnedRow = (rows: EntityTableRow[]) => {
 };
 
 /** 磁盘双选中：挂载与设备各自保持一行。设备只在首次或当前行失效时按挂载关联名默认。 */
-const useDiskDualSelection = (mountRows: EntityTableRow[], deviceRows: EntityTableRow[]) => {
+const useDiskDualSelection = (
+  mountRows: EntityTableRow[],
+  deviceRows: EntityTableRow[],
+  identity: string
+) => {
   const [mountKey, setMountKey] = useState('');
   const [deviceKey, setDeviceKey] = useState('');
   const [pendingMountKey, setPendingMountKey] = useState('');
   const [devicePinned, setDevicePinned] = useState(false);
+  const [seenIdentity, setSeenIdentity] = useState(identity);
+  if (identity !== seenIdentity) {
+    setSeenIdentity(identity);
+    setMountKey('');
+    setDeviceKey('');
+    setPendingMountKey('');
+    setDevicePinned(false);
+  }
 
   const resolvedMountKey = (
     (pendingMountKey && mountRows.some((row) => row.key === pendingMountKey) ? pendingMountKey : '')
@@ -147,6 +177,7 @@ export default function HostCategoryLayout({
   netState,
   processReady,
   processState = EMPTY_ENTITY,
+  gpuState = EMPTY_ENTITY,
   categoryTab = 'overview',
   onCategoryTabChange
 }: HostDetailLayoutProps) {
@@ -154,9 +185,21 @@ export default function HostCategoryLayout({
   const [uncontrolledTab, setUncontrolledTab] = useState('overview');
   const [alertCount, setAlertCount] = useState<number | null>(null);
   const [alertEvents, setAlertEvents] = useState<HostAlertRailEvent[]>([]);
+  const [eventsPhase, setEventsPhase] = useState<'loading' | 'ready'>('loading');
+  const eventsScopeRef = useRef<string | null>(null);
   const [alertDrawerOpen, setAlertDrawerOpen] = useState(false);
+  const alertDrawerOpenRef = useRef(false);
+  alertDrawerOpenRef.current = alertDrawerOpen;
   const [alertRefreshKey, setAlertRefreshKey] = useState(0);
   const [focusAlertId, setFocusAlertId] = useState('');
+  const instanceKey = String(dashboard.instanceId || '');
+  const [seenInstance, setSeenInstance] = useState(instanceKey);
+  if (instanceKey !== seenInstance) {
+    setSeenInstance(instanceKey);
+    setAlertCount(null);
+    setAlertEvents([]);
+    setFocusAlertId('');
+  }
   const openHostAlerts = useCallback(() => {
     setFocusAlertId('');
     setAlertDrawerOpen(true);
@@ -190,6 +233,11 @@ export default function HostCategoryLayout({
     return () => cancelAnimationFrame(frame);
   }, [activeTab]);
   const metrics = dashboard.metricSeries;
+  const chartWindow = useMemo(
+    () => selectProChartWindow(dashboard.timeValues, dashboard.queryTimeRange),
+    [dashboard.queryTimeRange, dashboard.timeValues]
+  );
+  const chartWindowKey = chartWindow ? `${chartWindow.startSec}|${chartWindow.endSec}` : '';
 
   const diskRows = useMemo(() => buildMountDiskRows(diskState.byMetric), [diskState.byMetric]);
   const diskDeviceRows = useMemo(() => buildDiskDeviceRows(diskState.byMetric), [diskState.byMetric]);
@@ -202,9 +250,16 @@ export default function HostCategoryLayout({
     () => buildLabelRows(processState.byMetric, 'process_name', 'process_cpu_usage', ['pattern']),
     [processState.byMetric]
   );
-  const diskSelection = useDiskDualSelection(diskRows, diskDeviceRows);
-  const netSelection = usePinnedRow(netRows);
-  const processSelection = usePinnedRow(processRows);
+  const gpuRows = useMemo(() => {
+    const byIndex = buildLabelRows(gpuState.byMetric, 'index', 'nvidia_smi_utilization_gpu', ['name', 'uuid']);
+    if (byIndex.length) return byIndex;
+    const byName = buildLabelRows(gpuState.byMetric, 'name', 'nvidia_smi_utilization_gpu', ['uuid', 'index']);
+    if (byName.length) return byName;
+    return buildLabelRows(gpuState.byMetric, 'uuid', 'nvidia_smi_utilization_gpu', ['name', 'index']);
+  }, [gpuState.byMetric]);
+  const diskSelection = useDiskDualSelection(diskRows, diskDeviceRows, instanceKey);
+  const netSelection = usePinnedRow(netRows, instanceKey);
+  const processSelection = usePinnedRow(processRows, instanceKey);
   const diskLoading = diskState.status === 'idle' || diskState.status === 'loading';
   const netLoading = netState.status === 'idle' || netState.status === 'loading';
   const processLoading = processState.status === 'idle' || processState.status === 'loading';
@@ -215,7 +270,7 @@ export default function HostCategoryLayout({
       metrics.mem_total?.viewData,
       metrics.mem_used_percent
     ).usedNow,
-    disk_used_percent: latestNumber(metrics.disk_used_percent),
+    disk_used_percent: maxRowValue(diskRows, 'disk_used_percent') ?? latestNumber(metrics.disk_used_percent),
     system_load1_per_core: loadPerCore(
       latestNumber(metrics.system_load1),
       latestNumber(metrics.cpu_n)
@@ -230,63 +285,54 @@ export default function HostCategoryLayout({
     processes_zombies: latestPreferCount(metrics.processes_zombies),
     process_cpu_usage: maxRowValue(processRows, 'process_cpu_usage'),
     process_mem_usage: maxRowValue(processRows, 'process_mem_usage')
-  }), [metrics, processRows]);
+  }), [diskRows, metrics, processRows]);
   const surfaceAlerts = useMemo(() => resolveHostSurfaceAlerts(tabReadings), [tabReadings]);
 
   useEffect(() => {
     if (activeTab === 'process' && !processReady) setActiveTab('overview');
   }, [activeTab, processReady, setActiveTab]);
 
+  const eventsScope = `${String(dashboard.instanceId || '')}|${
+    chartWindow ? Math.round(chartWindow.endSec - chartWindow.startSec) : ''
+  }`;
   useEffect(() => {
-    if (activeTab !== 'overview' || alertDrawerOpen) return undefined;
-    const instanceId = String(dashboard.instanceId || '');
-    if (!instanceId) {
-      setAlertCount(null);
-      setAlertEvents([]);
-      return undefined;
-    }
-    let active = true;
-    getMonitorAlert(activeHostAlertParams(instanceId, 1, 1))
-      .then((data) => {
-        if (active) setAlertCount(typeof data?.count === 'number' ? data.count : 0);
-      })
-      .catch(() => {
-        if (active) setAlertCount(null);
-      });
-    return () => {
-      active = false;
-    };
-  }, [activeTab, alertDrawerOpen, dashboard.instanceId, getMonitorAlert]);
-
-  useEffect(() => {
+    if (eventsScopeRef.current === eventsScope) return;
+    const first = eventsScopeRef.current == null;
+    eventsScopeRef.current = eventsScope;
+    if (first) return;
     setAlertEvents([]);
-  }, [dashboard.instanceId]);
+    setEventsPhase('loading');
+  }, [eventsScope]);
 
   useEffect(() => {
     if (activeTab !== 'overview') return undefined;
     const instanceId = String(dashboard.instanceId || '');
     if (!instanceId) {
+      setAlertCount(null);
       setAlertEvents([]);
+      setEventsPhase('ready');
       return undefined;
     }
     let active = true;
-    getMonitorAlert({
-      monitor_instance_id: instanceId,
-      page: 1,
-      page_size: 20
-    })
+    getMonitorAlert(overviewHostAlertParams(instanceId))
       .then((data) => {
         if (!active) return;
         setAlertEvents(hostAlertRailEvents(data?.results));
+        setEventsPhase('ready');
+        if (!alertDrawerOpenRef.current) {
+          setAlertCount(typeof data?.count === 'number' ? data.count : 0);
+        }
       })
       .catch(() => {
         if (!active) return;
         setAlertEvents([]);
+        setEventsPhase('ready');
+        if (!alertDrawerOpenRef.current) setAlertCount(null);
       });
     return () => {
       active = false;
     };
-  }, [activeTab, dashboard.instanceId, getMonitorAlert]);
+  }, [activeTab, chartWindowKey, dashboard.instanceId, dashboard.loadTick, getMonitorAlert]);
 
   const jump = (tab: 'disk' | 'net' | 'process', key: string) => {
     if (tab === 'disk') diskSelection.setPendingMountKey(key);
@@ -320,6 +366,8 @@ export default function HostCategoryLayout({
           pendingMetricNames={dashboard.pendingMetricNames}
           onRetryMetrics={dashboard.refetchMetricNames}
           alerts={surfaceAlerts.system}
+          gpuRows={gpuRows}
+          gpuLoading={gpuState.status === 'idle' || gpuState.status === 'loading'}
         />
       );
     }
@@ -368,7 +416,12 @@ export default function HostCategoryLayout({
     return (
       <OverviewPane
         metrics={metrics}
-        loading={dashboard.loading}
+        loading={
+          (dashboard.loading && dashboard.pendingMetricNames.size === 0)
+          || diskLoading
+          || HOST_OVERVIEW_KPI_METRICS.some((name) => dashboard.pendingMetricNames.has(name))
+        }
+        pendingMetricNames={dashboard.pendingMetricNames}
         diskRows={diskRows}
         diskLoading={diskLoading}
         netRows={netRows}
@@ -378,6 +431,7 @@ export default function HostCategoryLayout({
         processLoading={processLoading}
         alertCount={alertCount}
         alertEvents={alertEvents}
+        eventsLoading={eventsPhase === 'loading'}
         alertsOpen={alertDrawerOpen}
         onOpenAlerts={openHostAlerts}
         onFocusAlert={focusHostAlert}
@@ -388,6 +442,11 @@ export default function HostCategoryLayout({
   };
 
   return (
+    <ProTimeWindowProvider
+      timeValues={dashboard.timeValues}
+      queryTimeRange={dashboard.queryTimeRange}
+      suspend={dashboard.loading && dashboard.pendingMetricNames.size === 0}
+    >
     <div className={styles.root}>
       <div className={styles.tabBand}>
         <Tabs
@@ -416,5 +475,6 @@ export default function HostCategoryLayout({
         onCount={applyAlertCount}
       />
     </div>
+    </ProTimeWindowProvider>
   );
 }

@@ -1,0 +1,161 @@
+{
+  "object": "Host",
+  "plugin": "Host SNMP General",
+  "templates": [
+    {
+      "name": "主机CPU使用率过高",
+      "alert_name": "主机${resource_name} CPU使用率过高",
+      "description": "监控主机CPU使用率，当CPU使用率超过设定阈值时触发告警，便于发现主机性能瓶颈。",
+      "metric_name": "host_cpu_usage",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 95,
+          "method": ">"
+        },
+        {
+          "level": "error",
+          "value": 90,
+          "method": ">"
+        },
+        {
+          "level": "warning",
+          "value": 80,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "主机内存使用率过高",
+      "alert_name": "主机${resource_name} 内存使用率过高",
+      "description": "监控主机内存使用率，当内存使用率超过设定阈值时触发告警，帮助排查内存不足问题。",
+      "metric_name": "host_memory_usage",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 95,
+          "method": ">"
+        },
+        {
+          "level": "error",
+          "value": 90,
+          "method": ">"
+        },
+        {
+          "level": "warning",
+          "value": 80,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "主机磁盘使用率过高",
+      "alert_name": "主机${resource_name} 磁盘使用率过高",
+      "description": "监控主机磁盘使用率，当磁盘使用率超过设定阈值时触发告警，提醒及时清理磁盘空间。",
+      "metric_name": "host_disk_usage",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 95,
+          "method": ">"
+        },
+        {
+          "level": "error",
+          "value": 90,
+          "method": ">"
+        },
+        {
+          "level": "warning",
+          "value": 80,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "接口接收错误包过高",
+      "alert_name": "主机${resource_name} 接口 ${metric_ifDescr} 每秒接收错误包数过高",
+      "description": "监控主机接口接收的错误包数情况，当每秒错误包数超出设定阈值时触发告警，便于发现网络接口隐患。",
+      "metric_name": "interface_ifInErrors",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 100,
+          "method": ">"
+        },
+        {
+          "level": "error",
+          "value": 50,
+          "method": ">"
+        },
+        {
+          "level": "warning",
+          "value": 10,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "接口发送错误包过高",
+      "alert_name": "主机${resource_name} 接口 ${metric_ifDescr} 每秒发送错误包数过高",
+      "description": "监控主机接口发送端错误包数，每秒发送错误包数量超出限制时发出告警，及时定位和处理网络发送问题。",
+      "metric_name": "interface_ifOutErrors",
+      "algorithm": "last_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 100,
+          "method": ">"
+        },
+        {
+          "level": "error",
+          "value": 50,
+          "method": ">"
+        },
+        {
+          "level": "warning",
+          "value": 10,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "avg"
+    },
+    {
+      "name": "接口接收流量过高",
+      "alert_name": "主机${resource_name} 接口 ${metric_ifDescr} 接收流量过高",
+      "description": "监控接口接收数据流量，当流量超过设定最大值时触发警报，提醒潜在的网络带宽瓶颈或异常流量激增。",
+      "metric_name": "interface_ifInOctets",
+      "algorithm": "max_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 900,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "max"
+    },
+    {
+      "name": "接口发送流量过高",
+      "alert_name": "主机${resource_name} 接口 ${metric_ifDescr} 发送流量过高",
+      "description": "检查接口的发送流量情况，当数据发送速率过高时发出报警，帮助追踪与修复异常流量或设备问题。",
+      "metric_name": "interface_ifOutOctets",
+      "algorithm": "max_over_time",
+      "threshold": [
+        {
+          "level": "critical",
+          "value": 900,
+          "method": ">"
+        }
+      ],
+      "group_algorithm": "max"
+    }
+  ]
+}

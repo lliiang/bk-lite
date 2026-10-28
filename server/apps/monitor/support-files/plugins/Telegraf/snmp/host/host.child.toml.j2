@@ -1,0 +1,122 @@
+[[inputs.snmp]]
+    startup_error_behavior = "retry"
+    interval = "{{ interval }}s"
+    {% if version == 2 %}
+        agents = ["udp://{{ ip }}:{{ port }}"]
+        version = 2
+        community = "{{ community }}"
+        timeout = "{{ timeout }}s"
+    {% elif version == 3 %}
+        agents = ["udp://{{ ip }}:{{ port }}"]
+        version = 3
+        timeout = "{{ timeout }}s"
+        sec_name = "{{ sec_name }}"
+        sec_level = "{{ sec_level }}"
+        auth_protocol = "{{ auth_protocol }}"
+        auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
+        priv_protocol = "{{ priv_protocol }}"
+        priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
+    {% else %}
+    {% endif %}
+    [inputs.snmp.tags]
+        instance_id = "{{ instance_id }}"
+        instance_type = "{{ instance_type }}"
+        collect_type = "snmp"
+        config_type = "host"
+
+    # ---- HOST-RESOURCES-MIB: 系统基本信息 ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.3.0"
+        name = "uptime"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.1.5.0"
+        name = "source"
+        is_tag = true
+
+    # ---- HOST-RESOURCES-MIB: CPU 使用率 ----
+    # hrProcessorTable = 1.3.6.1.2.1.25.3.3，hrProcessorLoad = 1.3.6.1.2.1.25.3.3.1.2
+    [[inputs.snmp.table]]
+        name = "host_cpu"
+        oid = "1.3.6.1.2.1.25.3.3"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.25.3.3.1.2"
+            name = "cpu_usage"
+            is_tag = false
+
+    # ---- HOST-RESOURCES-MIB: 内存信息 ----
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.25.2.2.0"
+        name = "memory_total"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.25.2.3.1.5.1"
+        name = "memory_total"
+    [[inputs.snmp.field]]
+        oid = "1.3.6.1.2.1.25.2.3.1.6.1"
+        name = "memory_used"
+
+    # ---- HOST-RESOURCES-MIB: 磁盘信息 ----
+    # hrStorageTable = 1.3.6.1.2.1.25.2.3，hrStorageEntry = 1.3.6.1.2.1.25.2.3.1
+    [[inputs.snmp.table]]
+        name = "host_disk"
+        oid = "1.3.6.1.2.1.25.2.3"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.25.2.3.1.3"
+            name = "path"
+            is_tag = true
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.25.2.3.1.5"
+            name = "disk_total"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.25.2.3.1.6"
+            name = "disk_used"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.25.2.3.1.7"
+            name = "disk_failures"
+
+    # ---- IF-MIB: 网络接口表 ----
+    [[inputs.snmp.table]]
+        name = "interface"
+        oid = "1.3.6.1.2.1.2.2"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.2.2.1.2"
+            name = "ifDescr"
+            is_tag = true
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.2.2.1.5"
+            name = "ifSpeed"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.2.2.1.7"
+            name = "ifAdminStatus"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.2.2.1.8"
+            name = "ifOperStatus"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.2.2.1.10"
+            name = "ifInOctets"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.2.2.1.16"
+            name = "ifOutOctets"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.2.2.1.14"
+            name = "ifInErrors"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.2.2.1.20"
+            name = "ifOutErrors"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.2.2.1.11"
+            name = "ifInUcastPkts"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.2.2.1.17"
+            name = "ifOutUcastPkts"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.2.2.1.13"
+            name = "ifInDiscards"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.2.2.1.19"
+            name = "ifOutDiscards"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.31.1.1.1.6"
+            name = "ifHCInOctets"
+        [[inputs.snmp.table.field]]
+            oid = "1.3.6.1.2.1.31.1.1.1.10"
+            name = "ifHCOutOctets"

@@ -105,14 +105,32 @@ _VENDOR_FRU_FIELD_MAP = {
 }
 
 
+def _sanitize_string(value: Any) -> str:
+    """清理字符串中的 null 字节和控制字符，避免 PostgreSQL JSONB 写入失败。"""
+    if not isinstance(value, str):
+        return str(value)
+    # 移除 \x00 和 ASCII 控制字符（保留 \t \n \r）
+    cleaned = "".join(c for c in value if c in "\t\n\r" or ord(c) >= 32)
+    return cleaned.strip()
+
+
+def _sanitize_dict(data: Any) -> Any:
+    """递归清理 dict/list 中字符串的 null 字节和控制字符。"""
+    if isinstance(data, dict):
+        return {k: _sanitize_dict(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_sanitize_dict(item) for item in data]
+    if isinstance(data, str):
+        return _sanitize_string(data)
+    return data
+
+
 def first_value(data: Dict[str, Any], *keys: str) -> str:
-    """按候选字段顺序取第一个非空值，并去除字符串首尾空格；用于兼容不同厂商 FRU/inventory 返回的字段名差异。"""
+    """按候选字段顺序取第一个非空值，并去除字符串首尾空格/控制字符；用于兼容不同厂商 FRU/inventory 返回的字段名差异。"""
     for key in keys:
         value = data.get(key)
         if value not in (None, ""):
-            if isinstance(value, str):
-                return value.strip()
-            return str(value)
+            return _sanitize_string(value)
     return ""
 
 
@@ -442,7 +460,7 @@ class PhyscialServerIPMIInfo:
             "power_state": power_state,
             "health": health,
             "raw_payload": json.dumps(
-                system_info,
+                _sanitize_dict(system_info),
                 ensure_ascii=False,
                 default=lambda o: o.hex() if isinstance(o, (bytes, bytearray)) else str(o),
             ),

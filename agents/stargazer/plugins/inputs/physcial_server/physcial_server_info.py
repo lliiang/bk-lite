@@ -355,8 +355,16 @@ class PhyscialServerIPMIInfo:
 
     @staticmethod
     def _extract_cpu_info(frus: Dict[str, Dict[str, str]]) -> Dict[str, str]:
-        """从 FRU 记录中提取 CPU 信息；不同品牌 FRU 命名可能不同。"""
-        cpu_info: Dict[str, str] = {"cpu_vendor": "", "cpu_model": "", "cpu_core": "", "cpu_arch": ""}
+        """从 FRU 记录中提取 CPU 信息；提取核心数、线程数、频率。"""
+        import re
+        cpu_info: Dict[str, str] = {
+            "cpu_vendor": "",
+            "cpu_model": "",
+            "cpu_core": "",
+            "cpu_threads": "",
+            "cpu_arch": "",
+            "cpu_frequency": "",
+        }
         cpu_count = 0
         for name, data in frus.items():
             # 常见命名：CPU 1, CPU 2, Processor, CPU FRU 等
@@ -364,12 +372,28 @@ class PhyscialServerIPMIInfo:
                 continue
             cpu_count += 1
             vendor = first_value(data, "Product Manufacturer", "Manufacturer")
-            model = first_value(data, "Product Name", "Model")
+            model = first_value(data, "Product Version", "Product Name", "Model")
+            asset_tag = first_value(data, "Product Asset Tag")
+
             if not cpu_info["cpu_vendor"] and vendor:
                 cpu_info["cpu_vendor"] = vendor
             if not cpu_info["cpu_model"] and model:
                 cpu_info["cpu_model"] = model
-        if cpu_count:
+                # 从 Product Version 提取频率，如 "Intel(R) Xeon(R) Gold 5120 CPU @ 2.20GHz"
+                if "@" in model:
+                    freq_part = model.split("@")[-1].strip()
+                    if freq_part:
+                        cpu_info["cpu_frequency"] = freq_part
+            # 从 Product Asset Tag 提取核心数和线程数，如 "Max Core:14/Max Threads:28"
+            if asset_tag:
+                core_match = re.search(r"Max\s+Core\s*[:=]?\s*(\d+)", asset_tag, re.IGNORECASE)
+                thread_match = re.search(r"Max\s+Threads?\s*[:=]?\s*(\d+)", asset_tag, re.IGNORECASE)
+                if core_match:
+                    cpu_info["cpu_core"] = core_match.group(1)
+                if thread_match:
+                    cpu_info["cpu_threads"] = thread_match.group(1)
+
+        if cpu_count and not cpu_info["cpu_core"]:
             cpu_info["cpu_core"] = str(cpu_count)
         # IPMI 拿不到架构，按型号简单推断
         model_lower = cpu_info["cpu_model"].lower()
@@ -381,21 +405,48 @@ class PhyscialServerIPMIInfo:
 
     @staticmethod
     def _extract_memory_info(frus: Dict[str, Dict[str, str]]) -> list[Dict[str, str]]:
-        """从 FRU 记录中提取内存信息；返回内存对象列表。"""
+        """从 FRU 记录中提取内存信息；提取生产商、生产时间、序列号、部件号。"""
         memories: list[Dict[str, str]] = []
         for name, data in frus.items():
             upper = name.upper()
             if not any(k in upper for k in ("DIMM", "MEMORY", "RAM")):
                 continue
+            # 提取容量，优先 Memory size (MB)，其次 SDRAM Capacity (Mb)
+            capacity = first_value(data, "Memory size")
+            if not capacity:
+                capacity = first_value(data, "SDRAM Capacity")
+            # 提取内存类型
+            mem_type = first_value(data, "Memory Type", "Technology")
             memories.append({
                 "self_device": "",  # 由调用方填充
-                "manufacturer": first_value(data, "Product Manufacturer", "Manufacturer"),
-                "model": first_value(data, "Product Name", "Model"),
-                "part_number": first_value(data, "Product Part Number", "Part Number"),
-                "sn": first_value(data, "Product Serial", "Serial Number"),
-                "capacity": "",
+                "manufacturer": first_value(data, "Manufacturer", "Product Manufacturer"),
+                "manufacture_date": first_value(data, "Manufacture Date"),
+                "sn": first_value(data, "Serial Number", "Product Serial"),
+                "part_number": first_value(data, "Part Number", "Product Part Number"),
+                "capacity": capacity,
+                "type": mem_type,
+                "slot": name,  # 插槽位置，如 DIMM_23
             })
         return memories
+
+    @staticmethod
+    def _extract_psu_info(frus: Dict[str, Dict[str, str]]) -> list[Dict[str, str]]:
+        """从 FRU 记录中提取电源信息；提取厂商、型号、序列号、部件号。"""
+        psus: list[Dict[str, str]] = []
+        for name, data in frus.items():
+            upper = name.upper()
+            # 匹配 PSU 1, PSU 2, Power Supply, Power 等
+            if not any(k in upper for k in ("PSU", "POWER SUPPLY", "POWER")):
+                continue
+            psus.append({
+                "self_device": "",  # 由调用方填充
+                "manufacturer": first_value(data, "Board Mfg", "Manufacturer", "Product Manufacturer"),
+                "model": first_value(data, "Board Product", "Product Name", "Model"),
+                "part_number": first_value(data, "Board Part Number", "Product Part Number"),
+                "sn": first_value(data, "Board Serial", "Serial Number", "Product Serial"),
+                "slot": name,  # 插槽位置，如 PSU 1
+            })
+        return psus
 
     @staticmethod
     def _parse_ipmitool_fru(output: str) -> Dict[str, Dict[str, str]]:
@@ -438,6 +489,7 @@ class PhyscialServerIPMIInfo:
         power_state: str,
         health: str,
         memories: list[Dict[str, str]],
+        psus: list[Dict[str, str]],
     ) -> Dict[str, Any]:
         """把 System FRU 信息格式化为 CMDB 标准字段；按厂商选择字段名。"""
         vendor = _detect_vendor(system_info)
@@ -452,24 +504,78 @@ class PhyscialServerIPMIInfo:
             "cpu_vendor": cpu_info.get("cpu_vendor", ""),
             "cpu_model": cpu_info.get("cpu_model", ""),
             "cpu_core": cpu_info.get("cpu_core", ""),
-            "cpu_threads": "",
+            "cpu_threads": cpu_info.get("cpu_threads", ""),
             "cpu_arch": cpu_info.get("cpu_arch", ""),
+            "cpu_frequency": cpu_info.get("cpu_frequency", ""),
             "board_vendor": _get_fru_field(system_info, "board_vendor", vendor),
             "board_model": _get_fru_field(system_info, "board_model", vendor),
             "board_serial": _get_fru_field(system_info, "board_serial", vendor),
             "power_state": power_state,
             "health": health,
+            "physcial_server_memory": json.dumps(
+                [
+                    {
+                        "manufacturer": mem.get("manufacturer", ""),
+                        "manufacture_date": mem.get("manufacture_date", ""),
+                        "sn": mem.get("sn", ""),
+                        "part_number": mem.get("part_number", ""),
+                        "capacity": mem.get("capacity", ""),
+                        "type": mem.get("type", ""),
+                        "slot": mem.get("slot", ""),
+                    }
+                    for mem in memories
+                ],
+                ensure_ascii=False,
+            ),
+            "physcial_server_psu": json.dumps(
+                [
+                    {
+                        "manufacturer": psu.get("manufacturer", ""),
+                        "model": psu.get("model", ""),
+                        "part_number": psu.get("part_number", ""),
+                        "slot": psu.get("slot", ""),
+                        "sn": psu.get("sn", ""),
+                    }
+                    for psu in psus
+                ],
+                ensure_ascii=False,
+            ),
             "raw_payload": json.dumps(
                 _sanitize_dict(system_info),
                 ensure_ascii=False,
                 default=lambda o: o.hex() if isinstance(o, (bytes, bytearray)) else str(o),
             ),
         }
+
+        memory_items = [
+            {
+                "self_device": self.host,
+                "mem_locator": mem.get("slot", ""),
+                "mem_part_number": mem.get("part_number", ""),
+                "mem_type": mem.get("type", ""),
+                "mem_size": mem.get("capacity", ""),
+                "mem_sn": mem.get("sn", ""),
+            }
+            for mem in memories
+        ]
+        psu_items = [
+            {
+                "self_device": self.host,
+                "psu_name": psu.get("slot", ""),
+                "psu_vendor": psu.get("manufacturer", ""),
+                "psu_model": psu.get("model", ""),
+                "psu_sn": psu.get("sn", ""),
+                "psu_capacity_watts": "",
+            }
+            for psu in psus
+        ]
+
         return {
             "success": True,
             "result": {
                 self.model_id: [result_data],
-                "memory": [{**mem, "self_device": self.host} for mem in memories],
+                "memory": memory_items,
+                "psu": psu_items,
             },
         }
 
@@ -483,16 +589,32 @@ class PhyscialServerIPMIInfo:
         try:
             step_ts = time.time()
             system_info, all_frus = self._get_fru_data_via_ipmitool()
+            # 调试：打印所有 FRU 设备名和关键字段
+            logger.info(
+                "event=physical_server_ipmi_fru_debug host=%s fru_names=%s",
+                self.host,
+                list(all_frus.keys()),
+            )
+            for fru_name, fru_data in all_frus.items():
+                logger.info(
+                    "event=physical_server_ipmi_fru_item host=%s fru_name=%s fields=%s",
+                    self.host,
+                    fru_name,
+                    {k: v for k, v in fru_data.items() if k in ("Product Manufacturer", "Product Version", "Product Asset Tag", "Board Mfg", "Board Product", "Board Serial")},
+                )
             cpu_info = self._extract_cpu_info(all_frus)
             memories = self._extract_memory_info(all_frus)
+            psus = self._extract_psu_info(all_frus)
             power_state = self._get_power_state_via_ipmitool()
             health = self._get_health_via_sel()
             logger.info(
-                "event=physical_server_ipmi_collect_step host=%s step=read_fru_via_ipmitool elapsed_ms=%.0f fru_items=%s memory_count=%s",
+                "event=physical_server_ipmi_collect_step host=%s step=read_fru_via_ipmitool elapsed_ms=%.0f fru_items=%s memory_count=%s psu_count=%s cpu_info=%s",
                 self.host,
                 (time.time() - step_ts) * 1000,
                 list(all_frus.keys()),
                 len(memories),
+                len(psus),
+                cpu_info,
             )
             if not system_info:
                 return {
@@ -501,7 +623,7 @@ class PhyscialServerIPMIInfo:
                 }
 
             step_ts = time.time()
-            result = self._format_ipmi_result(system_info, cpu_info, power_state, health, memories)
+            result = self._format_ipmi_result(system_info, cpu_info, power_state, health, memories, psus)
             logger.info(
                 "event=physical_server_ipmi_collect_step host=%s step=format_result elapsed_ms=%.0f total_elapsed_ms=%.0f",
                 self.host,

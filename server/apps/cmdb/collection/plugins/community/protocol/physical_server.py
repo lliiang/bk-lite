@@ -81,11 +81,14 @@ class PhysicalServerProtocolCollectionPlugin(BaseProtocolCollectionPlugin):
         "board_serial": "board_serial",
         "cpu_vendor": "cpu_vendor",
         "cpu_model": "cpu_model",
-        "cpu_core": (HostCollectMetrics.transform_int, "cpu_cores"),
+        "cpu_core": (HostCollectMetrics.transform_int, "cpu_core"),
         "cpu_threads": (HostCollectMetrics.transform_int, "cpu_threads"),
         "cpu_arch": set_redfish_cpu_arch,
+        "cpu_frequency": "cpu_frequency",
         "power_state": "power_state",
         "health": "health",
+        "physcial_server_memory": "physcial_server_memory",
+        "physcial_server_psu": "physcial_server_psu",
         "inst_name": get_inst_name,
     }
     related_field_mappings = {

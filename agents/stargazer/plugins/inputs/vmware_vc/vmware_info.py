@@ -213,6 +213,96 @@ class VmwareManage(object):
 
         return result
 
+    def get_esxi_cdp(self):
+        """采集所有 ESXi 物理网卡的 CDP 邻居信息。
+
+        每台 ESXi 每个物理网卡一行；CDP 未启用或未协商到邻居时跳过。
+        关联字段 vmware_esxi 使用 ESXi 的 moId，供 CMDB 端解析实例名。
+
+        优先通过 QueryNetworkHint() 实时向 ESXi 查询 switchInfo（CDP 协商结果），
+        不依赖 vCenter 统计收集级别；pnic.cdpInfo 仅作 MAC 等基础信息补充。
+        """
+        result = []
+        cluster_list = self.get_all_objs(obj_type=[vim.ComputeResource])
+        for cluster in cluster_list:
+            for host in cluster.host:
+                host_moid = ""
+                host_name = ""
+                try:
+                    host_moid = host._moId
+                    host_name = host.name
+                except Exception as err:
+                    logger.error(f"get_esxi_cdp resolve host identity error! {err}")
+                    continue
+
+                pnic_map = {}
+                try:
+                    network = getattr(getattr(host, "config", None), "network", None)
+                    for pnic in getattr(network, "pnic", None) or []:
+                        pnic_map[getattr(pnic, "device", "")] = pnic
+                except Exception as err:
+                    logger.warning(f"get_esxi_cdp host {host_name}[{host_moid}] read pnic error! {err}")
+
+                hints = []
+                devices = [name for name in pnic_map if name]
+                logger.info(
+                    f"get_esxi_cdp host {host_name}[{host_moid}] pnic devices={devices}"
+                )
+                try:
+                    net_system = getattr(getattr(host, "configManager", None), "networkSystem", None)
+                    if net_system is not None and devices:
+                        # 必须带 device 参数：不带参只返回 vCenter 缓存（默认无 CDP），
+                        # 带参才会实时向 ESXi 主机查询最新 CDP/LLDP 协商结果。
+                        hints = net_system.QueryNetworkHint(device=devices) or []
+                except Exception as err:
+                    logger.warning(f"get_esxi_cdp host {host_name}[{host_moid}] query network hint error! {err}")
+
+                for hint in hints:
+                    # CDP 信息在 connectedSwitchPort 字段，不是 switchInfo
+                    switch = getattr(hint, "connectedSwitchPort", None)
+                    if not switch:
+                        logger.info(
+                            f"get_esxi_cdp host {host_name}[{host_moid}] hint {getattr(hint, 'device', '?')} connectedSwitchPort=None"
+                        )
+                        continue
+                    logger.info(
+                        f"get_esxi_cdp host {host_name}[{host_moid}] hint {getattr(hint, 'device', '?')} connectedSwitchPort=have "
+                        f"systemName={getattr(switch, 'systemName', '?')} "
+                        f"portId={getattr(switch, 'portId', '?')} "
+                        f"mgmtAddr={getattr(switch, 'mgmtAddr', '?')} "
+                        f"address={getattr(switch, 'address', '?')} "
+                        f"devId={getattr(switch, 'devId', '?')} "
+                        f"vlan={getattr(switch, 'vlan', '?')} "
+                        f"hardwarePlatform={getattr(switch, 'hardwarePlatform', '?')} "
+                        f"softwareVersion={getattr(switch, 'softwareVersion', '?')} "
+                        f"version={getattr(switch, 'version', '?')}"
+                    )
+                    nic_name = self._safe_str(getattr(hint, "device", ""))
+                    pnic = pnic_map.get(nic_name)
+                    try:
+                        result.append(
+                            {
+                                "inst_name": f"{nic_name}[{host_moid}]",
+                                "vmware_esxi": host_moid,
+                                "nic_name": nic_name,
+                                "nic_mac": self._safe_str(getattr(pnic, "mac", "")) if pnic is not None else self._safe_str(getattr(hint, "mac", "")),
+                                # connectedSwitchPort 是 vim.host.PhysicalNic.CdpInfo；systemName 常为空，优先 devId
+                                "switch_name": self._safe_str(getattr(switch, "devId", "")) or self._safe_str(getattr(switch, "systemName", "")),
+                                "switch_ip": self._safe_str(getattr(switch, "mgmtAddr", ""))
+                                or self._safe_str(getattr(switch, "address", "")),
+                                "switch_port": self._safe_str(getattr(switch, "portId", "")),
+                                "vlan": self._safe_str(getattr(switch, "vlan", "")),
+                                "platform": self._safe_str(getattr(switch, "hardwarePlatform", "")),
+                                "version": self._safe_str(getattr(switch, "softwareVersion", ""))
+                                or self._safe_str(getattr(switch, "version", "")),
+                            }
+                        )
+                    except Exception as err:
+                        logger.warning(f"get_esxi_cdp host {host_name}[{host_moid}] pnic {nic_name} parse error! {err}")
+
+        logger.info(f"get_esxi_cdp summary: collected={len(result)}")
+        return result
+
     @staticmethod
     def _get_vm_prop(vm, attributes):
         result = vm
@@ -555,12 +645,14 @@ class VmwareManage(object):
         datacenters, datastore = self.get_datacenters_and_datastore()
         vm_list = self.get_vms()
         esxi = self.get_hosts()
+        esxi_cdp = self.get_esxi_cdp()
 
         result = {
             "vmware_vc": [{"vc_version": vc_version, "inst_name": vc_name}],
             "vmware_ds": datastore,
             "vmware_vm": vm_list,
             "vmware_esxi": esxi,
+            "vmware_esxi_cdp": esxi_cdp,
         }
 
         return result

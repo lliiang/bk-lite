@@ -283,6 +283,7 @@ class VmwareManage(object):
                         result.append(
                             {
                                 "inst_name": f"{nic_name}[{host_moid}]",
+                                "resource_id": f"{nic_name}[{host_moid}]",
                                 "vmware_esxi": host_moid,
                                 "nic_name": nic_name,
                                 "nic_mac": self._safe_str(getattr(pnic, "mac", "")) if pnic is not None else self._safe_str(getattr(hint, "mac", "")),

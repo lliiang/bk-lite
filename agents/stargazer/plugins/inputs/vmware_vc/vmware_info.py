@@ -291,6 +291,8 @@ class VmwareManage(object):
                                 "switch_name": self._safe_str(getattr(switch, "devId", "")) or self._safe_str(getattr(switch, "systemName", "")),
                                 "switch_ip": self._safe_str(getattr(switch, "mgmtAddr", ""))
                                 or self._safe_str(getattr(switch, "address", "")),
+                                # 与 CMDB 网络设备实例名格式保持一致：{ip}-switch
+                                "switch_inst_name": f"{self._safe_str(getattr(switch, 'mgmtAddr', '')) or self._safe_str(getattr(switch, 'address', ''))}-switch",
                                 "switch_port": self._safe_str(getattr(switch, "portId", "")),
                                 "vlan": self._safe_str(getattr(switch, "vlan", "")),
                                 "platform": self._safe_str(getattr(switch, "hardwarePlatform", "")),

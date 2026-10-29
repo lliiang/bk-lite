@@ -50,6 +50,18 @@ VMWARE_MODEL_FIELD_MAPPING = {
         "storage": (int, "storage"),
         "url": "ds_url",
     },
+    "vmware_esxi_cdp": {
+        "inst_name": "inst_name",
+        "vmware_esxi": CollectVmwareMetrics.get_vm_esxi_name,
+        "nic_name": "nic_name",
+        "nic_mac": "nic_mac",
+        "switch_name": "switch_name",
+        "switch_ip": "switch_ip",
+        "switch_port": "switch_port",
+        "vlan": "vlan",
+        "platform": "platform",
+        "version": "version",
+    },
 }
 
 

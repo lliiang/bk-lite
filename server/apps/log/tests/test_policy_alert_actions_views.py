@@ -3,12 +3,17 @@
 补齐 enable / closed / last_event / stats / format_crontab 等未覆盖分支。
 只 mock 权限边界（get_permissions_rules），DB 走真实。
 """
+import minio.error
 import pytest
 from django.utils import timezone
 from django_celery_beat.models import CrontabSchedule, PeriodicTask
 from rest_framework import status
 from rest_framework.test import APIRequestFactory, force_authenticate
 
+# module_link 随测试裁剪常驻，解析 URL 时会导入 cmdb、monitor，monitor 启动再导入 node_mgmt。
+import apps.cmdb.models.change_record  # noqa: F401
+import apps.monitor.models.monitor_object  # noqa: F401
+import apps.node_mgmt.models.cloud_region  # noqa: F401
 from apps.core.exceptions.base_app_exception import BaseAppException
 from apps.core.utils.web_utils import WebUtils
 from apps.log.models.policy import Alert, Event, EventRawData, Policy, PolicyOrganization
@@ -76,6 +81,88 @@ def _invoke_alert_view(user, alert_id, method, action, data=None):
 
 def _allow_alert_view(mocker, policy_id):
     _mock_policy_permission(mocker, policy_id=policy_id, organization=1)
+
+
+class _MemoryObjectResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def read(self):
+        return self._payload
+
+    def close(self):
+        return None
+
+    def release_conn(self):
+        return None
+
+
+class _MemoryMinio:
+    """本文件的原始告警数据会走 MinIO；测试机没有 127.0.0.1:9000 时在内存里完成读写。"""
+
+    objects = {}
+
+    def __init__(self, *args, **kwargs):
+        return None
+
+    def bucket_exists(self, bucket_name):
+        return True
+
+    def make_bucket(self, bucket_name):
+        return None
+
+    def put_object(self, bucket_name, object_name, data, length, **kwargs):
+        payload = data.read() if hasattr(data, "read") else bytes(data)
+        self.objects[(bucket_name, object_name)] = payload
+
+    def get_object(self, bucket_name, object_name, **kwargs):
+        return _MemoryObjectResponse(self.objects[(bucket_name, object_name)])
+
+    def stat_object(self, bucket_name, object_name):
+        key = (bucket_name, object_name)
+        if key not in self.objects:
+            raise minio.error.S3Error(
+                "NoSuchKey",
+                "missing",
+                object_name,
+                "request",
+                "host",
+                None,
+                bucket_name=bucket_name,
+                object_name=object_name,
+            )
+        return type("ObjectStat", (), {"size": len(self.objects[key]), "last_modified": None})()
+
+    def remove_object(self, bucket_name, object_name):
+        self.objects.pop((bucket_name, object_name), None)
+
+
+@pytest.fixture(autouse=True)
+def _memory_minio(monkeypatch):
+    monkeypatch.setattr("django_minio_backend.models.minio.Minio", _MemoryMinio)
+
+
+def _mock_alert_instance_permission(mocker, policy_id, permissions):
+    """只授予对象实例权限，不带 team 级授权，避免 require_operate 被组织管理员绕过。"""
+    mocker.patch(
+        "apps.log.views.policy.get_permissions_rules",
+        return_value={
+            "data": {
+                "None": {
+                    "instance": [{"id": policy_id, "permission": list(permissions)}],
+                }
+            },
+        },
+    )
+
+
+def _assert_handlers_and_events_unchanged(alert, original_handlers):
+    alert.refresh_from_db()
+    assert alert.handlers == original_handlers
+    assert not Event.objects.filter(
+        alert=alert,
+        action__in=[Event.Action.ASSIGNED, Event.Action.REASSIGNED],
+    ).exists()
 
 
 # --------------------------- format_crontab (纯逻辑) ---------------------------
@@ -404,6 +491,82 @@ def test_patch_close_denied_by_operate_permission(authenticated_user, mocker):
     assert alert.status == "new"
 
 
+def _alert_put_payload(alert, policy):
+    return {
+        "id": alert.id,
+        "policy": policy.id,
+        "source_id": alert.source_id,
+        "collect_type": alert.collect_type_id,
+        "level": alert.level,
+        "value": alert.value,
+        "content": alert.content,
+        "status": alert.status,
+        "start_event_time": alert.start_event_time.isoformat() if alert.start_event_time else None,
+        "end_event_time": alert.end_event_time.isoformat() if alert.end_event_time else None,
+        "operator": alert.operator,
+        "handlers": [],
+        "info_event_count": alert.info_event_count,
+        "organizations": list(alert.organizations or []),
+    }
+
+
+@pytest.mark.django_db
+def test_view_only_patch_and_put_cannot_clear_alert_handlers(authenticated_user, mocker):
+    authenticated_user.is_superuser = False
+    authenticated_user.save(update_fields=["is_superuser"])
+    policy = _create_policy("view-only-handlers", organization=1)
+    alert = _create_alert(policy, "view-only-handlers-alert")
+    original_handlers = [authenticated_user.id + 1000]
+    alert.handlers = original_handlers
+    alert.save(update_fields=["handlers"])
+    _mock_alert_instance_permission(mocker, policy.id, ["View"])
+
+    patch_response = _invoke_alert_view(
+        authenticated_user,
+        alert.id,
+        "patch",
+        "partial_update",
+        {"handlers": []},
+    )
+
+    assert patch_response.status_code == status.HTTP_200_OK
+    _assert_handlers_and_events_unchanged(alert, original_handlers)
+
+    put_response = _invoke_alert_view(
+        authenticated_user,
+        alert.id,
+        "put",
+        "update",
+        _alert_put_payload(alert, policy),
+    )
+
+    assert put_response.status_code == status.HTTP_200_OK
+    _assert_handlers_and_events_unchanged(alert, original_handlers)
+
+
+@pytest.mark.django_db
+def test_operate_non_handler_patch_cannot_clear_alert_handlers(authenticated_user, mocker):
+    authenticated_user.is_superuser = False
+    authenticated_user.save(update_fields=["is_superuser"])
+    policy = _create_policy("operate-non-handler", organization=1)
+    alert = _create_alert(policy, "operate-non-handler-alert")
+    original_handlers = [authenticated_user.id + 1000]
+    alert.handlers = original_handlers
+    alert.save(update_fields=["handlers"])
+    _mock_alert_instance_permission(mocker, policy.id, ["View", "Operate"])
+
+    response = _invoke_alert_view(
+        authenticated_user,
+        alert.id,
+        "patch",
+        "partial_update",
+        {"handlers": []},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    _assert_handlers_and_events_unchanged(alert, original_handlers)
+
+
 # --------------------------- last_event ---------------------------
 
 
@@ -576,3 +739,57 @@ def test_stats_closed_alerts_still_use_default_seven_day_window(api_client, auth
     stats = stats_resp.json()["data"]
     assert stats["total"] == 0
     assert stats["time_series"] == []
+
+
+@pytest.mark.django_db
+def test_recovered_alert_rejects_close_claim_and_assign(api_client, authenticated_user, mocker):
+    policy = _create_policy("recovered-ops", organization=1)
+    alert = _create_alert(policy, "alert-recovered", status_value="recovered")
+    _mock_policy_permission(mocker, policy_id=policy.id, organization=1)
+    api_client.cookies["current_team"] = "1"
+
+    closed = api_client.post(f"/api/v1/log/alert/{alert.id}/closed/")
+    claim = api_client.post(f"/api/v1/log/alert/{alert.id}/claim/")
+    assign = api_client.post(
+        f"/api/v1/log/alert/{alert.id}/assign/",
+        {"handlers": [authenticated_user.id]},
+        format="json",
+    )
+    reassign = api_client.post(
+        f"/api/v1/log/alert/{alert.id}/reassign/",
+        {"handlers": [authenticated_user.id]},
+        format="json",
+    )
+
+    alert.refresh_from_db()
+    assert alert.status == "recovered"
+    assert alert.operator in (None, "")
+    assert closed.status_code == status.HTTP_200_OK
+    assert closed.json()["data"]["status"] == "recovered"
+    assert claim.status_code == 409
+    assert assign.status_code == 409
+    assert reassign.status_code == 409
+
+
+@pytest.mark.django_db
+def test_alert_list_and_stats_accept_comma_separated_status(api_client, authenticated_user, mocker):
+    from datetime import timedelta
+
+    policy = _create_policy("status-multi", organization=1)
+    _create_alert(policy, "alert-new", status_value="new")
+    _create_alert(policy, "alert-closed", status_value="closed")
+    recent = _create_alert(policy, "alert-recovered", status_value="recovered")
+    old = _create_alert(policy, "alert-recovered-old", status_value="recovered")
+    old_time = timezone.now() - timedelta(days=8)
+    Alert.objects.filter(id=old.id).update(created_at=old_time)
+    _mock_policy_permission(mocker, policy_id=policy.id, organization=1)
+    api_client.cookies["current_team"] = "1"
+
+    listed = api_client.get("/api/v1/log/alert/?status=closed,recovered")
+    assert listed.status_code == status.HTTP_200_OK
+    ids = {item["id"] for item in listed.json()["data"]["items"]}
+    assert ids == {"alert-closed", recent.id, old.id}
+
+    stats = api_client.get("/api/v1/log/alert/stats/?status=closed,recovered&step=60")
+    assert stats.status_code == status.HTTP_200_OK
+    assert stats.json()["data"]["total"] == 2

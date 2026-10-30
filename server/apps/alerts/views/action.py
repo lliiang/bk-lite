@@ -18,6 +18,8 @@ from apps.alerts.action.exceptions import ConfigError
 from apps.alerts.action.handlers.registry import get_handler
 from apps.alerts.action.overrides import validate_manual_param_overrides
 from apps.alerts.constants.constants import AlertStatus, LogAction, LogTargetType
+from apps.alerts.itsm.config import ItsmError
+from apps.alerts.itsm.service import retry_creation
 from apps.alerts.models.action import ActionExecution, ActionRule
 from apps.alerts.models.models import Alert
 from apps.alerts.serializers.action import ActionExecutionSerializer, ActionRuleSerializer
@@ -29,6 +31,7 @@ from apps.alerts.utils.permission_scope import (
     get_authorized_group_ids,
     get_current_team_from_request,
 )
+from apps.alerts.views.itsm import ItsmExecutionMixin, ItsmRuleMixin, error_response
 from apps.core.decorators.api_permission import HasPermission
 from apps.core.logger import alert_logger as logger
 from apps.job_mgmt.utils.callback_signer import verify_callback_signature
@@ -79,12 +82,17 @@ class ActionCallbackView(APIView):
         if not verify_job_signature(request):
             return Response({"result": False, "message": "invalid signature"}, status=403)
 
-        data = request.data
+        data = request.data if isinstance(request.data, dict) else {}
         task_id = data.get("task_id")
+        # 缺失 task_id 时不能按 job_task_id IS NULL 查询，否则会改写尚未回写的执行记录。
+        if task_id is None or task_id == "":
+            return Response({"result": False}, status=status.HTTP_400_BAD_REQUEST)
+
         execution = ActionExecution.objects.filter(job_task_id=task_id).order_by("-id").first()
         if not execution:
             logger.info("[callback] 未找到对应的 ActionExecution: job_task_id=%s", task_id)
-            return Response({"result": True})
+            # do_callback_task 把 2xx 当成已送达。缺行返回 503，沿用发送端最多 5 次重试。
+            return Response({"result": False}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
         status_val = "success" if data.get("status") == "success" else "failed"
         execution.status = status_val
@@ -105,7 +113,7 @@ class ActionCallbackView(APIView):
         return Response({"result": True})
 
 
-class ActionRuleViewSet(ModelViewSet):
+class ActionRuleViewSet(ItsmRuleMixin, ModelViewSet):
     """告警处理动作规则 CRUD 视图集。"""
 
     queryset = ActionRule.objects.all().order_by("-id")
@@ -187,7 +195,7 @@ class ActionRuleViewSet(ModelViewSet):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class ActionExecutionViewSet(viewsets.ReadOnlyModelViewSet):
+class ActionExecutionViewSet(ItsmExecutionMixin, viewsets.ReadOnlyModelViewSet):
     """告警执行记录只读视图集，支持手动触发。"""
 
     queryset = ActionExecution.objects.all().order_by("-created_at")
@@ -195,7 +203,7 @@ class ActionExecutionViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         scoped_alerts = apply_team_scope_for_request(Alert.objects.all(), self.request)
-        qs = super().get_queryset().filter(alert__in=scoped_alerts)
+        qs = super().get_queryset().filter(alert__in=scoped_alerts).select_related("rule", "alert")
         alert_id = self.request.query_params.get("alert_id")
         rule_id = self.request.query_params.get("rule_id")
         status_val = self.request.query_params.get("status")
@@ -241,6 +249,16 @@ class ActionExecutionViewSet(viewsets.ReadOnlyModelViewSet):
 
         if not rule.is_active:
             return Response({"detail": alerts_message(request, "error.alert_or_rule_inaccessible")}, status=status.HTTP_400_BAD_REQUEST)
+
+        if rule.action_type == "itsm":
+            try:
+                execution, created = retry_creation(alert.pk, rule.pk, request.user.username, client_key, authorized_group_ids)
+            except ItsmError as exc:
+                return error_response(exc)
+            return Response(
+                {"execution_id": execution.pk, "status": execution.status, "deduplicated": not created},
+                status=202 if created else 200,
+            )
 
         if alert.status not in AlertStatus.ACTIVATE_STATUS:
             return Response({"detail": alerts_message(request, "error.alert_closed_no_action")}, status=status.HTTP_400_BAD_REQUEST)

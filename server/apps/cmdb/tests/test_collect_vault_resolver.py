@@ -136,9 +136,9 @@ def test_every_plugin_binding_matches_builtin_credential_directory(binding, obje
     assert actual_builtin_type_keys(binding, [row]) == [key], object_id
 
 
-def test_mapping_covers_all_116_authenticating_tree_entries():
-    assert sum(len(ids) for ids in COLLECT_VAULT_BINDINGS.values()) == 116
-    assert len({object_id for ids in COLLECT_VAULT_BINDINGS.values() for object_id in ids}) == 116
+def test_mapping_covers_all_118_authenticating_tree_entries():
+    assert sum(len(ids) for ids in COLLECT_VAULT_BINDINGS.values()) == 118
+    assert len({object_id for ids in COLLECT_VAULT_BINDINGS.values() for object_id in ids}) == 118
 
 
 @pytest.mark.parametrize(
@@ -386,6 +386,59 @@ def test_dispatch_resolves_key_conversion_and_preserves_dynamic_fields(monkeypat
     assert all(resolved[field] == value for field, value in expected.items())
     assert "vault_credential_id" not in resolved
     assert "vault_actor_context" not in resolved
+
+
+def test_redis_explicit_sql_reference_is_not_dispatched_as_ssh_login(monkeypatch):
+    monkeypatch.setattr("apps.cmdb.services.collect_vault_resolver.actual_builtin_type_keys", lambda binding: [binding.split("/")[1]])
+    task = SimpleNamespace(
+        model_id="redis",
+        driver_type="job",
+        params={},
+        decrypt_credentials=[
+            {
+                "credential_source": "vault",
+                "vault_credential_id": "crd-sql",
+                "vault_type_key": "sql",
+                "vault_actor_context": ACTOR,
+                "port": 22,
+            }
+        ],
+    )
+    with pytest.raises(BaseAppException, match="类型与采集对象不匹配"):
+        resolve_task_credential_pool(
+            task,
+            resolver=lambda actor, credential_id: {
+                "result": True,
+                "data": {"type": "sql", "fields": {"username": "redisuser", "password": "vault-secret"}},
+            },
+        )
+
+
+def test_redis_legacy_job_without_saved_type_still_accepts_username_password(monkeypatch):
+    monkeypatch.setattr("apps.cmdb.services.collect_vault_resolver.actual_builtin_type_keys", lambda binding: [binding.split("/")[1]])
+    task = SimpleNamespace(
+        model_id="redis",
+        driver_type="job",
+        params={},
+        decrypt_credentials=[
+            {
+                "credential_source": "vault",
+                "vault_credential_id": "crd-legacy",
+                "vault_actor_context": ACTOR,
+                "port": 22,
+            }
+        ],
+    )
+    resolved = resolve_task_credential_pool(
+        task,
+        resolver=lambda actor, credential_id: {
+            "result": True,
+            "data": {"type": "sql", "fields": {"username": "legacy-user", "password": "vault-secret"}},
+        },
+    )[0]
+    assert resolved["username"] == "legacy-user"
+    assert resolved["password"] == "vault-secret"
+    assert resolved["port"] == 22
 
 
 def test_dispatch_rejects_disabled_or_type_mismatched_reference(monkeypatch):

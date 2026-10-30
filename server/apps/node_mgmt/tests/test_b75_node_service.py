@@ -144,9 +144,33 @@ def test_get_nodes_by_ips_returns_exact_minimal_nodes_in_organization(setup):
                 "id": node.id,
                 "ip": "10.1.1.1",
                 "operating_system": "linux",
+                "nats_executor_online": False,
             }
         ]
     }
+
+
+def test_nats_executor_online_reads_running_collector():
+    assert NodeService._nats_executor_online({"collectors": [{"collector_id": "natsexecutor_windows", "status": 0}]})
+    assert NodeService._nats_executor_online({"collectors": [{"collector_id": "natsexecutor_linux", "status": 2}]}) is False
+    assert NodeService._nats_executor_online({"collectors": [{"collector_id": "telegraf_linux", "status": 0}]}) is False
+    assert NodeService._nats_executor_online({}) is False
+
+
+@pytest.mark.django_db
+def test_get_nodes_by_ips_reports_running_nats_executor(setup):
+    region, _collector, node = setup
+    node.status = {
+        "collectors": [
+            {"collector_id": "natsexecutor_linux", "status": 0, "message": "Running"},
+            {"collector_id": "telegraf_linux", "status": 2},
+        ]
+    }
+    node.save(update_fields=["status"])
+
+    result = NodeService.get_nodes_by_ips(["10.1.1.1"], skip_permission=True)
+
+    assert result["nodes"][0]["nats_executor_online"] is True
 
 
 @pytest.mark.django_db
@@ -416,6 +440,22 @@ def test_get_node_list_page_size_all_is_capped(setup, monkeypatch):
 
     assert result["count"] == 3
     assert len(result["nodes"]) == 2
+    assert [item["id"] for item in result["nodes"]] == ["node-svc-1", "node-svc-2"]
+
+    page_two = NodeService.get_node_list(
+        organization_ids=[],
+        cloud_region_id=None,
+        name=None,
+        ip=None,
+        os=None,
+        page=2,
+        page_size=-1,
+        is_active=None,
+        is_manual=None,
+        is_container=None,
+        skip_permission=True,
+    )
+    assert [item["id"] for item in page_two["nodes"]] == ["node-svc-3"]
 
 
 @pytest.mark.django_db

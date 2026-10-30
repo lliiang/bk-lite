@@ -138,6 +138,7 @@
 | 小时周期 | 按固定小时间隔执行评估 | 间隔至少一小时；只有已绑定基线的目标产生合规结果 | GA |
 | 每日周期 | 按每日指定时间执行评估 | 时间采用小时和分钟 | GA |
 | 每周周期 | 按周几和指定时间执行评估 | 周一至周日 | GA |
+| 离线目录 | 启用后所有 Windows 评估使用已上传目录 | 环境级开关；选文件随保存一次提交，失败不替换；无可用目录且没有待保存文件时不能保存；评估时缺失则失败且不回退在线搜索 | GA |
 
 > 证据来源：server/apps/patch_mgmt/models/scan_setting.py:9-46，server/apps/patch_mgmt/views/scan_setting.py:24-40，server/apps/patch_mgmt/serializers/scan_setting.py:59-89，server/apps/patch_mgmt/tasks.py:65-94　|　同步基线：d2769559　|　【已实现】
 
@@ -151,7 +152,7 @@
 - 风险基于当前有效的主机—基线评估状态；存在逐要求快照时以快照判断具体补丁风险。
 - 基线当前只有生效中的固定清单，不提供历史版本管理。
 - Windows 已安装的替代 KB 可满足对应基线要求；替代关系由 WSUS 同步关系映射。
-- “不适用”状态不列为生产已实现能力：生产 Windows 解析当前不生成该事实，相关评估器与模型预留仍待确认。
+- Windows 不适用由两类已实现判断写入：目录产品、Build 或架构不匹配；带 .NET 标记的手工包与主机 Release 不匹配。其余 WUA 未解释的缺失仍是未知。
 - 功能清单不包含漏洞情报检索、任意第三方补丁源自动发现等未实现能力。
 
 > 证据来源：server/apps/patch_mgmt/services/wsus_sync.py:343-365，server/apps/patch_mgmt/services/assess_parsers.py:240-250，server/apps/patch_mgmt/services/assess_parsers.py:288-317，server/apps/patch_mgmt/services/compliance_evaluator.py:142-198　|　同步基线：d2769559　|　【已实现/待确认】

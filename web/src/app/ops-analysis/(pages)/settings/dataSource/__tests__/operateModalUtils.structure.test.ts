@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'vitest';
 import {
+  SOURCE_TYPE_ELASTICSEARCH,
   SOURCE_TYPE_EXCEL,
   SOURCE_TYPE_MYSQL,
   SOURCE_TYPE_NATS,
@@ -8,11 +9,16 @@ import {
   SOURCE_TYPE_PROMETHEUS,
   SOURCE_TYPE_REST_API,
   TABLE_CHART_TYPE,
+  TABULAR_CHART_TYPES,
   buildHydratedDatasourceFormState,
   canSaveExcelWithoutNewFile,
   getDatasourceSourceFlags,
   getPreviewFieldNames,
+  normalizeTabularChartTypes,
 } from '../operateModalUtils';
+import type { DatasourceItem } from '@/app/ops-analysis/types/dataSource';
+import { resolveDatasourceChartTypes } from '@/app/ops-analysis/components/widgetConfig/utils/tableSettingsBehavior';
+import { getChartTypeList } from '@/app/ops-analysis/constants/common';
 
 describe('getDatasourceSourceFlags', () => {
   it('marks nats as neither transform nor shared connection', () => {
@@ -20,6 +26,7 @@ describe('getDatasourceSourceFlags', () => {
       isNatsSource: true,
       isRestApiSource: false,
       isPrometheusSource: false,
+      isElasticsearchSource: false,
       isDatabaseSource: false,
       isExcelSource: false,
       supportsTransform: false,
@@ -38,6 +45,8 @@ describe('getDatasourceSourceFlags', () => {
     assert.equal(getDatasourceSourceFlags(SOURCE_TYPE_POSTGRESQL).supportsSharedConnection, true);
     assert.equal(getDatasourceSourceFlags(SOURCE_TYPE_REST_API).supportsSharedConnection, true);
     assert.equal(getDatasourceSourceFlags(SOURCE_TYPE_PROMETHEUS).supportsSharedConnection, false);
+    assert.equal(getDatasourceSourceFlags(SOURCE_TYPE_ELASTICSEARCH).supportsSharedConnection, true);
+    assert.equal(getDatasourceSourceFlags(SOURCE_TYPE_ELASTICSEARCH).supportsTransform, false);
   });
 });
 
@@ -89,6 +98,23 @@ describe('getPreviewFieldNames', () => {
         ['query_config', 'query_type'],
         ['query_config', 'time_range'],
         ['query_config', 'step'],
+      ],
+    );
+  });
+
+  it('validates elasticsearch inline url, index and query body', () => {
+    assert.deepEqual(
+      getPreviewFieldNames({
+        sourceType: SOURCE_TYPE_ELASTICSEARCH,
+        useSharedConnection: false,
+        elasticsearchAuthType: 'api_key',
+      }),
+      [
+        'source_type',
+        ['connection_config', 'url'],
+        ['connection_config', 'index'],
+        ['query_config', 'body'],
+        ['connection_config', 'api_key'],
       ],
     );
   });
@@ -151,7 +177,7 @@ describe('buildHydratedDatasourceFormState', () => {
     assert.ok(state.params.length > 0);
   });
 
-  it('restores excel imported preview and forces table chart type', () => {
+  it('restores excel imported preview and falls back from unsupported chart types to table', () => {
     const state = buildHydratedDatasourceFormState(
       {
         id: 4,
@@ -170,7 +196,7 @@ describe('buildHydratedDatasourceFormState', () => {
           imported_fields: [{ key: 'a', title: 'A', value_type: 'number' }],
         },
         params: [],
-        chart_type: ['line'],
+        chart_type: ['topologyMap'],
         namespaces: [],
         field_schema: [{ key: 'a', title: 'A', value_type: 'number' }],
       },
@@ -179,6 +205,78 @@ describe('buildHydratedDatasourceFormState', () => {
     assert.deepEqual(state.formValues.chart_type, [TABLE_CHART_TYPE]);
     assert.equal(state.excelPreview?.count, 1);
     assert.equal(state.schemaFields[0]?.id, 'schema-1');
+  });
+
+  it('hydrates elasticsearch like other tabular sources', () => {
+    const state = buildHydratedDatasourceFormState(
+      {
+        id: 8,
+        created_at: '',
+        updated_at: '',
+        created_by: '',
+        updated_by: '',
+        domain: '',
+        updated_by_domain: '',
+        name: 'es',
+        desc: '',
+        source_type: SOURCE_TYPE_ELASTICSEARCH,
+        query_config: {
+          time_field: '@timestamp',
+          body: { size: 10, query: { match_all: {} } },
+        },
+        params: [],
+        chart_type: ['pie', 'table'],
+        namespaces: [],
+      },
+      { createId: () => 'id-1' },
+    );
+    const queryConfig = state.formValues.query_config as Record<string, unknown>;
+    assert.equal(queryConfig.time_field, undefined);
+    assert.deepEqual(state.formValues.chart_type, ['pie', 'table']);
+    assert.deepEqual(state.params, []);
+  });
+});
+
+describe('tabular datasource chart selection', () => {
+  for (const sourceType of [
+    SOURCE_TYPE_REST_API,
+    SOURCE_TYPE_MYSQL,
+    SOURCE_TYPE_POSTGRESQL,
+    SOURCE_TYPE_EXCEL,
+    SOURCE_TYPE_ELASTICSEARCH,
+  ]) {
+    it(`preserves record-based chart selections through save and edit for ${sourceType}`, () => {
+      for (const selected of [...TABULAR_CHART_TYPES.map((type) => [type]), [...TABULAR_CHART_TYPES]]) {
+        const savedChartTypes = normalizeTabularChartTypes(selected);
+        assert.deepEqual(savedChartTypes, selected);
+        const state = buildHydratedDatasourceFormState({
+          source_type: sourceType,
+          chart_type: savedChartTypes,
+        } as DatasourceItem);
+        assert.deepEqual(state.formValues.chart_type, selected);
+        for (const surface of ['dashboard', 'screen'] as const) {
+          const available = resolveDatasourceChartTypes({
+            chartTypes: savedChartTypes,
+            chartTypeDefinitions: getChartTypeList(),
+            surface,
+          });
+          assert.deepEqual(available.map((item) => item.value), selected);
+        }
+        const reportTypes = resolveDatasourceChartTypes({
+          chartTypes: savedChartTypes,
+          chartTypeDefinitions: getChartTypeList(),
+          surface: 'report',
+        });
+        assert.deepEqual(reportTypes.map((item) => item.value), selected.filter((type) => ['table', 'eventTable'].includes(type)));
+      }
+    });
+  }
+
+  it('keeps the table default and excludes unsupported visualizations', () => {
+    assert.deepEqual(normalizeTabularChartTypes(), ['table']);
+    assert.deepEqual(normalizeTabularChartTypes([]), ['table']);
+    assert.deepEqual(normalizeTabularChartTypes(['topologyMap', 'room3D']), ['table']);
+    assert.deepEqual(normalizeTabularChartTypes(['topologyMap', 'cardList']), ['cardList']);
   });
 });
 

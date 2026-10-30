@@ -439,7 +439,8 @@
       "descriptionPlaceholder": "请输入补丁描述",
       "severityRequired": "请选择严重级别",
       "select": "请选择",
-      "versionPlaceholder": "例如 Windows Server 2019",
+      "versionPlaceholder": "请选择 Windows Server 版本",
+      "versionRequired": "请选择适用版本",
       "distroRequired": "请输入发行版",
       "distroPlaceholder": "例如 Rocky 8",
       "minimumVersion": "最低版本要求",
@@ -455,7 +456,7 @@
       "editPatch": "编辑补丁",
       "saved": "已保存",
       "packageNotReplaceable": "补丁包已就绪或正在处理中，暂不能替换",
-      "packageRetryHelp": "上次上传失败，可删除旧文件后重新选择 MSU 或 CAB 文件",
+      "packageRetryHelp": "上次上传失败，请重新选择 MSU 或 CAB 文件",
       "packageReuploadRequired": "请重新上传 MSU 或 CAB 补丁文件",
       "selectFile": "选择文件"
     },
@@ -746,6 +747,16 @@
       "noticeConfigurationIncomplete": "请先完善通知配置",
       "triggerTitle": "什么时候会触发评估",
       "saveSettings": "保存设置",
+      "enableOfflineCatalog": "启用离线目录",
+      "offlineCatalogHelp": "启用后，Windows 评估使用已上传的离线目录，不再连接 Windows Update。关闭后继续使用目标机当前的在线更新服务。离线目录从微软下载：",
+      "offlineCatalogDrop": "点击或拖拽 CAB 文件到此处",
+      "offlineCatalogFileType": "请上传 .cab 文件",
+      "offlineCatalogKept": "已保存的目录仍会保留，保存设置后才会替换",
+      "uploadOfflineCatalog": "上传目录",
+      "offlineCatalogRequired": "请先上传离线目录",
+      "offlineCatalogUploaded": "离线目录已上传",
+      "offlineCatalogUpdatedTime": "更新于 {time}",
+      "offlineCatalogRemove": "移除文件",
       "scanSettings": "扫描设置"
     }
   }

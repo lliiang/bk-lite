@@ -1,8 +1,10 @@
 import type { HostCategoryTab } from './tab-level';
 
 /**
- * 概览 KPI、本机趋势、页签色点用到的主机级查询。
- * 磁盘总使用率图走实体挂载序列；这里的 disk_used_percent 只给概览页签/卡气味。
+ * 概览 KPI、四条本机趋势、各页签危度点用到的主机级查询。
+ * 磁盘使用率 KPI / 页签气味 / 最满挂载捷径同一口径：最满挂载点。
+ * 交换用量点亮性能页签，阻塞/僵尸点亮进程页签；这两处在概览就要有数，不能等进页再拉。
+ * 主机级 disk_used_percent 是 max by instance_id；实体挂载序列给 KPI 主值、捷径和总使用率趋势。
  */
 export const HOST_OVERVIEW_METRIC_NAMES = [
   'cpu_usage_total',
@@ -14,7 +16,12 @@ export const HOST_OVERVIEW_METRIC_NAMES = [
   'system_uptime',
   'disk_used_percent',
   'net_bytes_recv_rate',
-  'net_bytes_sent_rate'
+  'net_bytes_sent_rate',
+  'host_mem_swap_used_bytes',
+  'host_mem_swap_total_bytes',
+  'mem_swap_free',
+  'processes_blocked',
+  'processes_zombies'
 ] as const;
 
 /** 性能页 KPI、趋势、详细指标用到的主机级查询。不含磁盘、网络、进程。 */
@@ -24,6 +31,7 @@ export const HOST_PERFORMANCE_METRIC_NAMES = [
   'cpu_usage_system_total',
   'cpu_usage_iowait_total',
   'cpu_usage_irq_total',
+  'cpu_usage_softirq_total',
   'cpu_usage_steal_total',
   'system_load1',
   'system_load5',
@@ -39,11 +47,7 @@ export const HOST_PERFORMANCE_METRIC_NAMES = [
   'mem_shared',
   'host_mem_swap_used_bytes',
   'host_mem_swap_total_bytes',
-  'mem_swap_free',
-  'nvidia_smi_utilization_gpu',
-  'nvidia_smi_memory_used',
-  'nvidia_smi_memory_total',
-  'nvidia_smi_temperature_gpu'
+  'mem_swap_free'
 ] as const;
 
 /** 磁盘页主机级查询。挂载/块设备走实体 hook，这里不拉主机指标。 */

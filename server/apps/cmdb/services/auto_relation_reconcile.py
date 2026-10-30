@@ -1,8 +1,6 @@
-from celery import chain, current_app
-from django.db import transaction
-
 from apps.cmdb.constants.constants import INSTANCE, INSTANCE_ASSOCIATION
 from apps.cmdb.graph.drivers.graph_client import GraphClient
+from apps.cmdb.models.auto_relation_pending import AutoRelationPending
 from apps.cmdb.services.auto_relation_rule import (
     AUTO_RELATION_MATCHING_RULE_CONTAINS,
     AUTO_RELATION_MATCHING_RULE_EXACT,
@@ -25,56 +23,31 @@ INSTANCE_BATCH_RECONCILE_TASK = "apps.cmdb.tasks.celery_tasks.reconcile_instance
 RULE_FULL_SYNC_TASK = "apps.cmdb.tasks.celery_tasks.full_sync_auto_association_rule_task"
 INCOMING_FULL_SYNC_TASK = "apps.cmdb.tasks.celery_tasks.sync_incoming_auto_association_task"
 AUTO_RELATION_BATCH_SIZE = 500
-_PENDING_RULE_FULL_SYNC_IDS: set[str] = set()
 
 
 def schedule_instance_auto_relation_reconcile(instance_ids: list[int] | tuple[int, ...] | set[int] | None) -> None:
     normalized_ids = AutoRelationRuleReconcileService._normalize_instance_ids(instance_ids)
-
     if not normalized_ids:
         return
-
-    def _dispatch() -> None:
-        if len(normalized_ids) <= AUTO_RELATION_BATCH_SIZE:
-            current_app.send_task(INSTANCE_BATCH_RECONCILE_TASK, args=[normalized_ids])
-            return
-        # 串行分批，避免一次批量操作同时占满 worker；入向同步仅在整批结束后派发。
-        tasks = [
-            current_app.signature(
-                INSTANCE_BATCH_RECONCILE_TASK,
-                args=[normalized_ids[offset : offset + AUTO_RELATION_BATCH_SIZE]],
-                kwargs={"schedule_incoming": False},
-                immutable=True,
-            )
-            for offset in range(0, len(normalized_ids), AUTO_RELATION_BATCH_SIZE)
-        ]
-        tasks.append(current_app.signature(INCOMING_FULL_SYNC_TASK, args=[normalized_ids], immutable=True))
-        chain(*tasks).apply_async()
-
-    transaction.on_commit(_dispatch)
+    AutoRelationPending.objects.bulk_create(
+        [AutoRelationPending(instance_id=instance_id) for instance_id in normalized_ids],
+        ignore_conflicts=True,
+    )
 
 
 def schedule_rule_auto_relation_full_sync(model_asst_ids: list[str] | tuple[str, ...] | set[str] | None) -> None:
     normalized_ids = []
     for model_asst_id in list(model_asst_ids or []):
         normalized_id = str(model_asst_id or "").strip()
-        if not normalized_id or normalized_id in normalized_ids or normalized_id in _PENDING_RULE_FULL_SYNC_IDS:
+        if not normalized_id or normalized_id in normalized_ids:
             continue
         normalized_ids.append(normalized_id)
-        _PENDING_RULE_FULL_SYNC_IDS.add(normalized_id)
-
     if not normalized_ids:
         return
-
-    def _dispatch() -> None:
-        try:
-            for model_asst_id in normalized_ids:
-                current_app.send_task(RULE_FULL_SYNC_TASK, args=[model_asst_id])
-        finally:
-            for model_asst_id in normalized_ids:
-                _PENDING_RULE_FULL_SYNC_IDS.discard(model_asst_id)
-
-    transaction.on_commit(_dispatch)
+    AutoRelationPending.objects.bulk_create(
+        [AutoRelationPending(model_asst_id=model_asst_id) for model_asst_id in normalized_ids],
+        ignore_conflicts=True,
+    )
 
 
 def schedule_incoming_rule_full_sync_by_model_ids(model_ids: list[str] | tuple[str, ...] | set[str] | None) -> None:
@@ -95,6 +68,105 @@ def schedule_incoming_rule_full_sync_by_model_ids(model_ids: list[str] | tuple[s
                 rule_ids.append(model_asst_id)
 
     schedule_rule_auto_relation_full_sync(rule_ids)
+
+
+def _claim_pending(field: str, limit: int | None = None) -> list:
+    query = AutoRelationPending.objects.filter(**{f"{field}__isnull": False}).order_by("id").values_list("id", field)
+    if limit is not None:
+        query = query[:limit]
+    rows = list(query)
+    if not rows:
+        return []
+    AutoRelationPending.objects.filter(id__in=[row[0] for row in rows]).delete()
+    return [row[1] for row in rows]
+
+
+def _restore_pending_instances(instance_ids: list[int]) -> None:
+    if not instance_ids:
+        return
+    AutoRelationPending.objects.bulk_create(
+        [AutoRelationPending(instance_id=instance_id) for instance_id in instance_ids],
+        ignore_conflicts=True,
+    )
+
+
+def _restore_pending_rules(model_asst_ids: list[str]) -> None:
+    if not model_asst_ids:
+        return
+    AutoRelationPending.objects.bulk_create(
+        [AutoRelationPending(model_asst_id=model_asst_id) for model_asst_id in model_asst_ids],
+        ignore_conflicts=True,
+    )
+
+
+def _drain_instance_rows() -> tuple[int, list[str]]:
+    done = 0
+    incoming: list[str] = []
+    deferred: list[int] = []
+    claimed: list[int] = []
+    try:
+        while True:
+            instance_ids = _claim_pending("instance_id", AUTO_RELATION_BATCH_SIZE)
+            if not instance_ids:
+                break
+            claimed.extend(instance_ids)
+            summary = AutoRelationRuleReconcileService.reconcile_for_instances(instance_ids, schedule_incoming=False)
+            failed_ids = []
+            for item in summary.get("failed") or []:
+                instance_id = item.get("instance_id")
+                if instance_id in instance_ids and instance_id not in failed_ids:
+                    failed_ids.append(instance_id)
+            succeeded = [instance_id for instance_id in instance_ids if instance_id not in failed_ids]
+            for model_asst_id in AutoRelationRuleReconcileService.incoming_rule_ids(succeeded):
+                if model_asst_id not in incoming:
+                    incoming.append(model_asst_id)
+            deferred.extend(failed_ids)
+            done += len(succeeded)
+    except Exception:
+        _restore_pending_instances(list(dict.fromkeys(claimed)))
+        raise
+    _restore_pending_instances(deferred)
+    return done, incoming
+
+
+def _drain_rule_rows(extra_rule_ids: list[str]) -> int:
+    claimed = _claim_pending("model_asst_id")
+    rule_ids = []
+    for model_asst_id in [*extra_rule_ids, *claimed]:
+        if model_asst_id and model_asst_id not in rule_ids:
+            rule_ids.append(model_asst_id)
+    done: list[str] = []
+    try:
+        for model_asst_id in rule_ids:
+            AutoRelationRuleReconcileService.full_sync_rule(model_asst_id)
+            done.append(model_asst_id)
+    except Exception:
+        _restore_pending_rules([model_asst_id for model_asst_id in rule_ids if model_asst_id not in done])
+        raise
+    return len(done)
+
+
+def drain_auto_relation_pending() -> dict:
+    """排空待重算名单。实例按批重算，规则在同一轮里全量同步。"""
+    stage = "reconcile_instances"
+    try:
+        instances_done, incoming_rules = _drain_instance_rows()
+        stage = "full_sync_rules"
+        rules_done = _drain_rule_rows(incoming_rules)
+    except Exception as exc:
+        logger.exception(
+            "[AutoRelationRule] pending drain failed, failed_stage=%s, error_type=%s",
+            stage,
+            type(exc).__name__,
+        )
+        raise
+    if instances_done or rules_done:
+        logger.info(
+            "[AutoRelationRule] pending drain finished, instances=%s, rules=%s",
+            instances_done,
+            rules_done,
+        )
+    return {"instances": instances_done, "rules": rules_done, "success": True}
 
 
 class AutoRelationRuleReconcileService:
@@ -334,6 +406,8 @@ class AutoRelationRuleReconcileService:
         rules: list[AutoRelationRule],
         target_instances: list[dict] | TargetSnapshot | None = None,
         target_claims: dict[int, int] | None = None,
+        *,
+        phase: str = "full",
     ) -> dict:
         model_asst_id = association["model_asst_id"]
         if target_instances is None:
@@ -346,12 +420,17 @@ class AutoRelationRuleReconcileService:
             if edge.get(AUTO_RELATION_EDGE_SOURCE_FIELD) == AUTO_RELATION_EDGE_SOURCE and edge.get(AUTO_RELATION_EDGE_RULE_ID_FIELD) == model_asst_id
         ]
         all_existing_target_uuids = {edge.get("dst_inst_uuid") for edge in existing_edges}
+        if phase not in {"full", "delete", "create"}:
+            raise ValueError(f"unsupported reconcile phase: {phase}")
+
         desired_target_ids = cls._calculate_desired_target_ids(source_instance, association, rules, target_instances=snapshot)
+        # 删除看源自己是否还匹配，不用其他源的占用把仍匹配的自动边清掉。
+        # 多目标歧义仍会把期望清空，因此该路径下的旧自动边继续删除。
         desired_target_ids, mapping_conflicts = cls._filter_desired_targets_for_mapping(
             association,
             source_instance,
             desired_target_ids,
-            target_claims=target_claims,
+            target_claims=None if phase == "delete" else target_claims,
         )
 
         summary = {
@@ -364,13 +443,17 @@ class AutoRelationRuleReconcileService:
             "conflicts": mapping_conflicts,
         }
 
-        desired_target_uuids = {snapshot.by_id[target_id]["inst_uuid"] for target_id in desired_target_ids}
-        for edge in auto_edges:
-            if edge.get("dst_inst_uuid") in desired_target_uuids:
-                continue
-            with GraphClient() as ag:
-                ag.delete_edge(edge["_id"])
-            summary["deleted"] += 1
+        if phase != "create":
+            desired_target_uuids = {snapshot.by_id[target_id]["inst_uuid"] for target_id in desired_target_ids}
+            for edge in auto_edges:
+                if edge.get("dst_inst_uuid") in desired_target_uuids:
+                    continue
+                with GraphClient() as ag:
+                    ag.delete_edge(edge["_id"])
+                summary["deleted"] += 1
+
+        if phase == "delete":
+            return summary
 
         for dst_inst_id in desired_target_ids:
             dst_inst_uuid = snapshot.by_id[dst_inst_id]["inst_uuid"]
@@ -557,10 +640,21 @@ class AutoRelationRuleReconcileService:
             cls._query_instances_by_model(association["dst_model_id"], fields=cls._matching_fields(enabled_rules, "dst"))
         )
         source_instances = cls._query_instances_by_model(association["src_model_id"], fields=cls._matching_fields(enabled_rules, "src"))
-        target_claims: dict[int, int] | None = {} if cls._get_mapping(association) in {"1:n", "1:1"} else None
         summary["mode"] = "full_sync"
         summary["source_instances"] = len(source_instances)
+        # 快照已完整返回。先跨源删掉本规则下不再匹配的自动边，再创建。
+        # 若按源边删边建，1:n/1:1 换源时新边会撞上还没删的旧自动边，本轮被记成冲突后不再补建。
+        for source_instance in source_instances:
+            item_summary = cls.reconcile_source_instance(
+                source_instance,
+                association,
+                enabled_rules,
+                target_instances=target_instances,
+                phase="delete",
+            )
+            summary["deleted"] += item_summary["deleted"]
 
+        target_claims: dict[int, int] | None = {} if cls._get_mapping(association) in {"1:n", "1:1"} else None
         for source_instance in source_instances:
             item_summary = cls.reconcile_source_instance(
                 source_instance,
@@ -568,17 +662,19 @@ class AutoRelationRuleReconcileService:
                 enabled_rules,
                 target_instances=target_instances,
                 target_claims=target_claims,
+                phase="create",
             )
             summary["created"] += item_summary["created"]
-            summary["deleted"] += item_summary["deleted"]
             summary["skipped"] += item_summary["skipped"]
             summary["conflicts"] += item_summary["conflicts"]
 
         return summary
 
     @classmethod
-    def sync_incoming_for_instances(cls, instance_ids: list[int]) -> dict:
+    def incoming_rule_ids(cls, instance_ids: list[int]) -> list[str]:
         normalized_ids = cls._normalize_instance_ids(instance_ids)
+        if not normalized_ids:
+            return []
         models = set()
         with GraphClient() as ag:
             for offset in range(0, len(normalized_ids), AUTO_RELATION_BATCH_SIZE):
@@ -589,5 +685,15 @@ class AutoRelationRuleReconcileService:
                     include_count=False,
                 )
                 models.update(instance["model_id"] for instance in instances)
-        schedule_incoming_rule_full_sync_by_model_ids(sorted(models))
-        return {"models": len(models), "success": True}
+        rule_ids: list[str] = []
+        for model_id in sorted(models):
+            for model_asst_id in cls._list_enabled_rule_ids_by_dst_model(model_id):
+                if model_asst_id not in rule_ids:
+                    rule_ids.append(model_asst_id)
+        return rule_ids
+
+    @classmethod
+    def sync_incoming_for_instances(cls, instance_ids: list[int]) -> dict:
+        rule_ids = cls.incoming_rule_ids(instance_ids)
+        schedule_rule_auto_relation_full_sync(rule_ids)
+        return {"rules": len(rule_ids), "success": True}

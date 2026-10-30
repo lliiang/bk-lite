@@ -9,7 +9,8 @@ import { formatMetricValue } from '../../../shared/utils/format';
 import type { MetricUnit } from '../../../shared/types';
 import { HOST_PALETTE, HOST_SERIES_COLOR } from '../config';
 import { formatDuration, type MetricSeries } from '../../common/simple-dashboard-core';
-import { CardAlertDot, cardAlertClass } from './card-alert';
+import { pointsToChartData, type EntityTableRow } from '../entity-series';
+import { CardAlertDot, cardAlertClass, type CardAlertFold } from './card-alert';
 import ThinTimeSeries from './thin-time-series';
 import type { HostSurfaceAlerts } from './tab-level';
 import { metricBlockPhase, type MetricBlockPhase } from './performance-scope';
@@ -22,18 +23,21 @@ import {
   primaryChartSeries,
   resolveMemoryUsage
 } from './readings';
+import ProDashLoading from './pro-dash-loading';
 import classic from '../index.module.scss';
 import styles from './layered.module.scss';
 
 /** system / steal 没有对应的序列 token，色值跟构成表。 */
 const CPU_SYSTEM_COLOR = '#86909C';
 const CPU_STEAL_COLOR = '#F5319D';
+const CPU_SOFTIRQ_COLOR = HOST_PALETTE.cyan;
 
 const CPU_BREAKDOWN = [
   { key: 'cpu_usage_user_total', label: 'user', color: HOST_SERIES_COLOR.cpu },
   { key: 'cpu_usage_system_total', label: 'system', color: CPU_SYSTEM_COLOR },
   { key: 'cpu_usage_iowait_total', label: 'iowait', color: HOST_SERIES_COLOR.load1 },
   { key: 'cpu_usage_irq_total', label: 'irq', color: HOST_SERIES_COLOR.diskUsed },
+  { key: 'cpu_usage_softirq_total', label: 'softirq', color: CPU_SOFTIRQ_COLOR },
   { key: 'cpu_usage_steal_total', label: 'steal', color: CPU_STEAL_COLOR }
 ];
 
@@ -55,13 +59,22 @@ const MEM_COMPOSITION = [
   { key: 'mem_shared', label: 'shared', color: HOST_SERIES_COLOR.diskUsed }
 ] as const;
 
-const GPU_SERIES = [
-  { key: 'nvidia_smi_utilization_gpu', title: 'GPU 使用率', unit: 'percent' as const },
-  { key: 'nvidia_smi_memory_used', title: 'GPU已使用显存', unit: 'mebibytes' as const },
-  { key: 'nvidia_smi_temperature_gpu', title: 'GPU 温度', unit: 'celsius' as const }
+const GPU_CHARTS = [
+  { key: 'nvidia_smi_utilization_gpu', titleKey: 'gpuUtilization' as const, unit: 'percent' as const },
+  { key: 'nvidia_smi_memory_used', titleKey: 'gpuMemoryUsed' as const, unit: 'mebibytes' as const },
+  { key: 'nvidia_smi_temperature_gpu', titleKey: 'gpuTemperature' as const, unit: 'celsius' as const }
 ] as const;
 
 const SWAP_SERIES_COLOR = HOST_PALETTE.emerald;
+
+const gpuCardTitle = (row: EntityTableRow, fallback: string) => {
+  const index = row.labels.index;
+  const name = row.labels.name;
+  if (index && name) return `${fallback} ${index} · ${name}`;
+  if (index) return `${fallback} ${index}`;
+  if (name) return name;
+  return fallback;
+};
 
 /** 同一时间点 total - part。对不齐的点丢掉。 */
 const subtractAligned = (
@@ -255,12 +268,16 @@ export default function SystemPane({
   metrics,
   pendingMetricNames = EMPTY_PENDING,
   onRetryMetrics,
-  alerts
+  alerts,
+  gpuRows = [],
+  gpuLoading = false
 }: {
   metrics: Record<string, MetricSeries | undefined>;
   pendingMetricNames?: ReadonlySet<string>;
   onRetryMetrics?: (names: string[]) => void;
   alerts: HostSurfaceAlerts['system'];
+  gpuRows?: EntityTableRow[];
+  gpuLoading?: boolean;
 }) {
   const { t } = useDashboardText();
   const [memoryView, setMemoryView] = useState<ComposeView>('pie');
@@ -299,6 +316,8 @@ export default function SystemPane({
     metrics.cpu_usage_iowait_total?.loadState,
     metrics.cpu_usage_irq_total?.viewData,
     metrics.cpu_usage_irq_total?.loadState,
+    metrics.cpu_usage_softirq_total?.viewData,
+    metrics.cpu_usage_softirq_total?.loadState,
     metrics.cpu_usage_steal_total?.viewData,
     metrics.cpu_usage_steal_total?.loadState
   ]);
@@ -370,6 +389,7 @@ export default function SystemPane({
     phase: MetricBlockPhase;
     valueColor?: string;
     alertLevel?: HostSurfaceAlerts['system']['cpu'];
+    fold?: CardAlertFold;
   }> = [
     {
       key: 'cpu',
@@ -398,7 +418,8 @@ export default function SystemPane({
       value: formatPlain(load1Now),
       unit: '',
       valueColor: LOAD1_SERIES_COLOR,
-      alertLevel: alerts.load
+      alertLevel: alerts.load,
+      fold: alerts.load === 'warn' ? 'outline' as const : undefined
     }] : []),
     {
       key: 'uptime',
@@ -512,6 +533,8 @@ export default function SystemPane({
     metrics.mem_used?.loadState
   ]);
   const memoryBytes = memoryCompose.parts.reduce((sum, item) => sum + item.bytes, 0);
+  const composeNames = ['mem_used', 'mem_cached', 'mem_buffered', 'mem_shared', 'mem_total', 'mem_available'] as const;
+  const composeLoading = phaseFor(composeNames, memoryCompose.series.length > 0) === 'loading';
   const cpuCompose = useMemo(() => {
     const series = CPU_BREAKDOWN.flatMap((item) => {
       const data = primaryChartSeries(metrics[item.key]?.viewData);
@@ -529,16 +552,16 @@ export default function SystemPane({
     metrics.cpu_usage_system_total?.viewData,
     metrics.cpu_usage_iowait_total?.viewData,
     metrics.cpu_usage_irq_total?.viewData,
+    metrics.cpu_usage_softirq_total?.viewData,
     metrics.cpu_usage_steal_total?.viewData
   ]);
-  const gpuCharts = GPU_SERIES.filter((item) => metricHasPoints(metrics[item.key]));
-  const gpuMemUsed = latestNumber(metrics.nvidia_smi_memory_used);
-  const gpuMemTotal = latestNumber(metrics.nvidia_smi_memory_total);
-  const gpuMemReading = gpuMemUsed == null
-    ? undefined
-    : gpuMemTotal == null
-      ? formatMebibytes(gpuMemUsed)
-      : `${formatMebibytes(gpuMemUsed)} / ${formatMebibytes(gpuMemTotal)}`;
+  const gpuMemReadingOf = (row: EntityTableRow) => {
+    const used = row.values.nvidia_smi_memory_used;
+    const total = row.values.nvidia_smi_memory_total;
+    if (used == null || !Number.isFinite(used)) return undefined;
+    if (total == null || !Number.isFinite(total)) return formatMebibytes(used);
+    return `${formatMebibytes(used)} / ${formatMebibytes(total)}`;
+  };
 
   return (
     <>
@@ -548,14 +571,10 @@ export default function SystemPane({
       <div className={styles.instantKpiRow}>
         {instantCards.map((card) => (
           <section key={card.key} className={`${classic.panel} ${styles.instantKpi} ${cardAlertClass(card.alertLevel)}`}>
-            <CardAlertDot level={card.alertLevel} valueColor={card.valueColor} />
+            <CardAlertDot level={card.alertLevel} fold={card.fold} />
             <div className={styles.instantKpiLabel}>{card.label}</div>
             {card.phase === 'loading' ? (
-              <span
-                className="mt-1 block h-4 w-16 rounded bg-[var(--color-fill-2)]"
-                aria-busy="true"
-                aria-label="加载中"
-              />
+              <ProDashLoading size="small" layout="inline" />
             ) : card.phase === 'error' ? (
               <button
                 type="button"
@@ -599,10 +618,17 @@ export default function SystemPane({
               bare
               title=""
               unit="bytes"
+              loading={composeLoading}
               data={memoryCompose.trend}
               emptyText="暂无数据"
               legends={memoryCompose.series.map((item) => ({ label: item.label, color: item.color }))}
             />
+          ) : composeLoading ? (
+            <div className={styles.chartBody}>
+              <div className={styles.chartEmpty}>
+                <ProDashLoading />
+              </div>
+            </div>
           ) : memoryBytes > 0 ? (
             <CompositionDonut
               slices={memoryCompose.parts.map((item) => ({
@@ -628,11 +654,11 @@ export default function SystemPane({
             />
           </div>
           {breakdownPhase === 'loading' ? (
-            <span
-              className="mt-1 block h-4 w-16 rounded bg-[var(--color-fill-2)]"
-              aria-busy="true"
-              aria-label="加载中"
-            />
+            <div className={styles.chartBody}>
+              <div className={styles.chartEmpty}>
+                <ProDashLoading />
+              </div>
+            </div>
           ) : breakdownPhase === 'error' ? (
             <button
               type="button"
@@ -669,41 +695,54 @@ export default function SystemPane({
           legends={[{ label: '已用', color: SWAP_SERIES_COLOR }]}
         />
       </div>
-      <div className={styles.detailFull} data-surface="gpu">
-        <div className={styles.gpuBandTitle}>GPU</div>
-        {gpuCharts.length ? (
-          <div className={styles.gpuRow}>
-            {GPU_SERIES.map((item) => {
-              const title = item.key === 'nvidia_smi_memory_used'
-                ? hostCategoryText(t, 'gpuMemoryUsed')
-                : item.title;
-              return (
-                <ThinTimeSeries
-                  key={item.key}
-                  className={styles.detailCard}
-                  title={title}
-                  unit={item.unit}
-                  data={primaryChartSeries(metrics[item.key]?.viewData)}
-                  emptyText="暂无数据"
-                  reading={item.key === 'nvidia_smi_memory_used' ? gpuMemReading : undefined}
-                  legends={[{
-                    label: title,
-                    color: item.key === 'nvidia_smi_temperature_gpu'
-                      ? HOST_PALETTE.orange
-                      : item.key === 'nvidia_smi_memory_used'
-                        ? HOST_PALETTE.blue
-                        : HOST_PALETTE.emerald
-                  }]}
-                />
-              );
-            })}
+      {gpuRows.length ? (
+        <div className={styles.detailFull} data-surface="gpu">
+          {gpuRows.map((row) => {
+            const bandTitle = gpuRows.length > 1 ? gpuCardTitle(row, 'GPU') : 'GPU';
+            return (
+              <div key={row.key} className={styles.gpuBand}>
+                <div className={styles.gpuBandTitle}>{bandTitle}</div>
+                <div className={styles.gpuRow}>
+                  {GPU_CHARTS.map((item) => {
+                    const title = hostCategoryText(t, item.titleKey);
+                    const points = row.series[item.key] || [];
+                    return (
+                      <ThinTimeSeries
+                        key={item.key}
+                        className={styles.detailCard}
+                        title={title}
+                        unit={item.unit}
+                        data={pointsToChartData(points.length ? [{ points }] : [])}
+                        emptyText="暂无数据"
+                        reading={item.key === 'nvidia_smi_memory_used' ? gpuMemReadingOf(row) : undefined}
+                        legends={[{
+                          label: title,
+                          color: item.key === 'nvidia_smi_temperature_gpu'
+                            ? HOST_PALETTE.orange
+                            : item.key === 'nvidia_smi_memory_used'
+                              ? HOST_PALETTE.blue
+                              : HOST_PALETTE.emerald
+                        }]}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : gpuLoading ? (
+        <div className={styles.detailFull} data-surface="gpu">
+          <div className={styles.gpuBand}>
+            <div className={styles.gpuBandTitle}>GPU</div>
+            <span
+              className="block h-4 w-16 rounded bg-[var(--color-fill-2)]"
+              aria-busy="true"
+              aria-label="加载中"
+            />
           </div>
-        ) : (
-          <section className={`${classic.panel} ${styles.chartPanel} ${styles.detailCard} ${styles.gpuBand}`}>
-            <div className={styles.gpuEmpty}>{hostCategoryText(t, 'noGpu')}</div>
-          </section>
-        )}
-      </div>
+        </div>
+      ) : null}
     </>
   );
 }

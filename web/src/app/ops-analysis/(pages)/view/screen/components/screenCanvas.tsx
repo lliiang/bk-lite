@@ -25,6 +25,10 @@ import type { DashboardWidgetRenderResult } from "@/app/ops-analysis/renderContr
 import type { CanvasRuntimeRefreshCause } from "@/app/ops-analysis/utils/canvasRefreshTimer";
 import type { OpsChartThemeMode } from "@/app/ops-analysis/utils/chartTheme";
 import { getScreenRndNodeClassName } from "../utils/classNames";
+import {
+  getScreenResizeEnablement,
+  screenGeometryFromResize,
+} from "../utils/screenResizeHandles";
 import { calculateScreenVisualMetrics } from "../utils/metrics";
 import { resolveScreenCanvasBackgroundStyle } from "../utils/screenBackground";
 import {
@@ -121,6 +125,7 @@ interface ScreenRndItemProps {
   editable: boolean;
   selected: boolean;
   scale: number;
+  scaleY?: number;
   minWidth?: number;
   minHeight?: number;
   children: React.ReactNode;
@@ -168,6 +173,7 @@ const ScreenRndItem: React.FC<ScreenRndItemProps> = React.memo(
     editable,
     selected,
     scale,
+    scaleY = scale,
     minWidth = 160,
     minHeight = 110,
     children,
@@ -208,6 +214,19 @@ const ScreenRndItem: React.FC<ScreenRndItemProps> = React.memo(
         h: Math.round(nextGeometry.h),
       });
     };
+
+    const liveResizeEnablement = getScreenResizeEnablement({
+      editable,
+      selected,
+      width: geometry.w,
+      height: geometry.h,
+      scaleX: scale,
+      scaleY,
+    });
+    const resizeEnablementRef = useRef(liveResizeEnablement);
+    if (!interactingRef.current) {
+      resizeEnablementRef.current = liveResizeEnablement;
+    }
 
     useEffect(() => {
       return () => {
@@ -352,16 +371,7 @@ const ScreenRndItem: React.FC<ScreenRndItemProps> = React.memo(
         minHeight={minHeight}
         dragHandleClassName="screen-widget-frame__drag-handle"
         cancel="button,input,textarea,.ant-select"
-        enableResizing={{
-          top: false,
-          right: false,
-          bottom: false,
-          left: false,
-          topRight: editable && selected,
-          bottomRight: editable && selected,
-          bottomLeft: editable && selected,
-          topLeft: editable && selected,
-        }}
+        enableResizing={resizeEnablementRef.current}
         resizeHandleClasses={{
           top: "screen-rnd-handle screen-rnd-handle--n",
           right: "screen-rnd-handle screen-rnd-handle--e",
@@ -407,31 +417,21 @@ const ScreenRndItem: React.FC<ScreenRndItemProps> = React.memo(
           onSelectItem?.(item.id);
         }}
         onResize={(_, __, ref, ___, position) => {
-          updateGeometry({
-            x: position.x,
-            y: position.y,
-            w: ref.offsetWidth,
-            h: ref.offsetHeight,
-          });
+          updateGeometry(screenGeometryFromResize(ref, position));
         }}
         onResizeStop={(_, __, ref, ___, position) => {
-          const nextGeometry = {
-            x: position.x,
-            y: position.y,
-            w: ref.offsetWidth,
-            h: ref.offsetHeight,
-          };
+          const nextGeometry = screenGeometryFromResize(ref, position);
           updateGeometry(nextGeometry);
           interactingRef.current = false;
           ref.style.zIndex = String(item.zIndex);
           ref.classList.remove("screen-rnd-node--interacting");
           onResizeItem?.(item.id, {
-            w: Math.round(nextGeometry.w),
-            h: Math.round(nextGeometry.h),
+            w: nextGeometry.w,
+            h: nextGeometry.h,
           });
           onMoveItem?.(item.id, {
-            x: Math.round(nextGeometry.x),
-            y: Math.round(nextGeometry.y),
+            x: nextGeometry.x,
+            y: nextGeometry.y,
           });
         }}
       >
@@ -563,6 +563,7 @@ const ScreenCanvasNode = React.memo(function ScreenCanvasNode({
       editable={editable}
       selected={editable && selected}
       scale={scale}
+      scaleY={scaleY}
       minWidth={
         isScreenWidgetItem(item) ? (item.chartType === 'single' ? 72 : 160) : 24
       }
@@ -969,6 +970,7 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
           width: 8px !important;
           height: 8px !important;
           left: calc(50% - 4px) !important;
+          cursor: ns-resize !important;
         }
 
         .screen-rnd-handle--e,
@@ -976,6 +978,7 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
           width: 8px !important;
           height: 8px !important;
           top: calc(50% - 4px) !important;
+          cursor: ew-resize !important;
         }
 
         .screen-rnd-handle--n {
@@ -1037,10 +1040,18 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
           bottom: -4px !important;
         }
 
+        .screen-rnd-node--selected:hover .screen-rnd-handle--n,
+        .screen-rnd-node--selected:hover .screen-rnd-handle--e,
+        .screen-rnd-node--selected:hover .screen-rnd-handle--s,
+        .screen-rnd-node--selected:hover .screen-rnd-handle--w,
         .screen-rnd-node--selected:hover .screen-rnd-handle--nw,
         .screen-rnd-node--selected:hover .screen-rnd-handle--ne,
         .screen-rnd-node--selected:hover .screen-rnd-handle--sw,
         .screen-rnd-node--selected:hover .screen-rnd-handle--se,
+        .screen-rnd-node--interacting .screen-rnd-handle--n,
+        .screen-rnd-node--interacting .screen-rnd-handle--e,
+        .screen-rnd-node--interacting .screen-rnd-handle--s,
+        .screen-rnd-node--interacting .screen-rnd-handle--w,
         .screen-rnd-node--interacting .screen-rnd-handle--nw,
         .screen-rnd-node--interacting .screen-rnd-handle--ne,
         .screen-rnd-node--interacting .screen-rnd-handle--sw,
@@ -1144,7 +1155,12 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
 
         .screen-widget-frame__header:has(.screen-widget-frame__title-link) .screen-widget-frame__title {
           width: auto;
-          flex: 0 1 auto;
+          flex: 1 1 auto;
+        }
+
+        .screen-widget-frame--editable:hover .screen-widget-frame__header:has(.screen-widget-frame__title-link),
+        .screen-widget-frame--editable:focus-within .screen-widget-frame__header:has(.screen-widget-frame__title-link) {
+          padding-right: calc((var(--screen-widget-title-padding, 10px) + 8px) * var(--screen-widget-ui-scale));
         }
 
         .screen-widget-frame__title-link {
@@ -1152,7 +1168,8 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
           flex-shrink: 0;
           align-items: center;
           justify-content: center;
-          width: calc(14px * var(--screen-widget-ui-scale));
+          margin-left: calc(-6px * var(--screen-widget-ui-scale));
+          width: 0;
           height: calc(14px * var(--screen-widget-ui-scale));
           padding: 0;
           border: 0;
@@ -1161,6 +1178,20 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
           font-size: calc(14px * var(--screen-widget-ui-scale));
           line-height: 1;
           cursor: pointer;
+          overflow: hidden;
+          opacity: 0;
+          pointer-events: none;
+        }
+
+        .screen-rnd-node:hover .screen-widget-frame__title-link,
+        .screen-rnd-node:focus-within .screen-widget-frame__title-link,
+        .screen-widget-frame:hover .screen-widget-frame__title-link,
+        .screen-widget-frame:focus-within .screen-widget-frame__title-link {
+          width: calc(14px * var(--screen-widget-ui-scale));
+          margin-left: auto;
+          overflow: visible;
+          opacity: 1;
+          pointer-events: auto;
         }
 
         .screen-widget-frame__title-link .anticon {
@@ -1173,12 +1204,19 @@ const ScreenCanvas: React.FC<ScreenCanvasProps> = ({
         }
 
         .screen-text-item__title-link {
-          width: 1em;
+          width: 0;
+          margin-left: -0.4em;
           height: 1em;
           flex-shrink: 0;
           font-size: 1em;
           outline: none;
           box-shadow: none;
+        }
+
+        .screen-rnd-node:hover .screen-text-item__title-link,
+        .screen-rnd-node:focus-within .screen-text-item__title-link {
+          width: 1em;
+          margin-left: 0;
         }
 
         .screen-text-item__title-link:focus,

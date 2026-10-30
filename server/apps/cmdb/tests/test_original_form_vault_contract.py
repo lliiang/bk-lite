@@ -157,7 +157,7 @@ def test_vault_auth_maps_to_original_form_keys_without_page_secrets(monkeypatch,
         assert result["password"] == "secret-value"
 
 
-@pytest.mark.parametrize("entry", [e for e in ENTRIES if e["type"] == "job" and e["id"] != "pc"], ids=lambda e: e["id"])
+@pytest.mark.parametrize("entry", [e for e in ENTRIES if e["type"] == "job" and e["id"] not in {"pc", "hyperv_host"}], ids=lambda e: e["id"])
 def test_script_jobs_select_ssh_type_in_their_object_category(entry):
     expected = entry["binding"].split("/")[0] + "/ssh"
     assert binding_for_collect_object(entry["id"], model_id=entry["model_id"], driver_type="job") == expected
@@ -192,7 +192,8 @@ def test_job_vault_actual_builtin_validation_and_saved_type_lock(type_key, store
     def resolve(*_):
         return {"result": True, "data": {"type": type_key, "fields": fields}}
 
-    if stored_type and stored_type != type_key:
+    # 显式保存的 sql 类型不再当作 SSH 登录；未记录类型的旧任务仍兼容用户名密码凭据。
+    if stored_type == "sql" or (stored_type and stored_type != type_key):
         with pytest.raises(BaseAppException, match="类型与采集对象不匹配"):
             resolve_task_credential_pool(task, resolver=resolve)
     else:

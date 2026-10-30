@@ -195,7 +195,6 @@ const ReportWidgetCard: React.FC<ReportWidgetCardProps> = ({
                   <h3 className="m-0 min-w-0 truncate text-sm font-medium text-[var(--color-text-1)]">
                     {title.trim() ? title : t('opsAnalysis.report.unnamedComponent')}
                   </h3>
-                  <InteractionTitleIcon config={section.valueConfig} />
                 </div>
                 {section.valueConfig.description?.trim() && (
                   <p className="mt-0.5 mb-0 truncate text-xs text-[var(--color-text-3)]">
@@ -222,6 +221,7 @@ const ReportWidgetCard: React.FC<ReportWidgetCardProps> = ({
                   onClick={exportCsv}
                 />
               )}
+              <InteractionTitleIcon config={section.valueConfig} />
               {menuItems.length > 0 && (
                 <div data-export-hidden="true">
                   <MoreActionsDropdown

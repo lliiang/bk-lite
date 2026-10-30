@@ -29,7 +29,10 @@ import { useTranslation } from '@/utils/i18n';
 import { useSearchParams } from 'next/navigation';
 import { useDirectoryApi } from '@/app/ops-analysis/api/index';
 import { useUserInfoContext } from '@/context/userInfo';
-import { ExportModal, ImportModal } from './importExport';
+import { convertGroupTreeToTreeSelectData } from '@/utils/index';
+import { ExportModal, ImportModal, ImportUpdateModal } from './importExport';
+import type { ImportUpdateResponse } from '@/app/ops-analysis/api/importExport';
+import { canvasSelectionAfterImportUpdate } from '@/app/ops-analysis/utils/canvasImportUpdate';
 import CopyCanvasModal from './copyCanvasModal';
 import { ObjectType } from '@/app/ops-analysis/api/importExport';
 import { buildDefaultScreenViewSets } from '@/app/ops-analysis/(pages)/view/screen/utils/viewport';
@@ -44,8 +47,13 @@ import {
 } from '@/app/ops-analysis/constants/canvasTypes';
 import {
   buildDirectoryEditPayload,
+  collectDirectoryChainGroupIds,
   collectDirectoryExpandKeys,
+  filterGroupTreeByAllowedIds,
+  getSidebarCanvasMenuKeys,
+  isBuiltinCanvasGroupEditable,
   isBuiltinDirectory,
+  retainAllowedGroupIds,
   shouldShowCanvasCopyAction,
 } from '@/app/ops-analysis/utils/canvasDirectoryCopy';
 import {
@@ -68,16 +76,24 @@ import {
   BranchesOutlined,
 } from '@ant-design/icons';
 import { resolveSidebarTreeSelection } from '@/app/ops-analysis/utils/sidebarSelection';
+import {
+  useHomepagePreference,
+} from '@/app/ops-analysis/context/homepagePreference';
+import {
+  homepageDirectoryActionKeys,
+  homepageDirectoryLoadingPlaceholderKeys,
+  type HomepageDirectoryActionKey,
+} from '@/app/ops-analysis/utils/homepageDirectoryActions';
 
 const Sidebar = forwardRef<SidebarRef, SidebarProps>(
-  ({ onSelect, onDataUpdate }, ref) => {
+  ({ onSelect, onDataUpdate, onCanvasContentReplaced, beforeImportUpdate }, ref) => {
     const [form] = Form.useForm();
     const selectedCanvasType = Form.useWatch('canvasType', form) as
       | CanvasType
       | undefined;
     const { t } = useTranslation();
     const searchParams = useSearchParams();
-    const { selectedGroup } = useUserInfoContext();
+    const { selectedGroup, groupTree } = useUserInfoContext();
     const { hasPermission } = useBtnPermissions();
     const networkTopologyApi = useNetworkTopologyApi();
     const [dirs, setDirs] = useState<DirItem[]>([]);
@@ -93,11 +109,21 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
     const [selectedKeys, setSelectedKeys] = useState<React.Key[]>([]);
     const { getDirectoryTree, createItem, updateItem, deleteItem, copyItem } =
       useDirectoryApi();
+    const {
+      state: homepageState,
+      isLoading: homepageStateLoading,
+      applyPersonal,
+      applyGlobal,
+    } = useHomepagePreference();
     const [currentDir, setCurrentDir] = useState<DirItem | null>(null);
+    const [groupScopeDirectoryId, setGroupScopeDirectoryId] = useState<
+      number | string | null
+    >(null);
     const [exportModalVisible, setExportModalVisible] = useState(false);
     const [exportItem, setExportItem] = useState<DirItem | null>(null);
     const [importModalVisible, setImportModalVisible] = useState(false);
     const [importTargetDir, setImportTargetDir] = useState<DirItem | null>(null);
+    const [importUpdateItem, setImportUpdateItem] = useState<DirItem | null>(null);
     const [copyModalVisible, setCopyModalVisible] = useState(false);
     const [copySource, setCopySource] = useState<DirItem | null>(null);
     const [copySubmitting, setCopySubmitting] = useState(false);
@@ -107,6 +133,16 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
     const showNetworkTopologyConnectionTest =
       (isCreatingCanvas || modalAction === 'edit') &&
       activeCanvasType === 'networkTopology';
+    const builtinIdentityLocked =
+      modalAction === 'edit' &&
+      (isBuiltinDirectory(currentDir) || isBuiltinCanvasGroupEditable(currentDir));
+    const builtinCanvasGroupTree =
+      modalAction === 'edit' && isBuiltinCanvasGroupEditable(currentDir)
+        ? filterGroupTreeByAllowedIds(
+          convertGroupTreeToTreeSelectData(groupTree || []),
+          collectDirectoryChainGroupIds(dirs, groupScopeDirectoryId),
+        )
+        : undefined;
 
     useImperativeHandle(
       ref,
@@ -139,17 +175,27 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
       title: string,
       defaultValue = '',
       dir: DirItem | null = null,
-      itemType: DirectoryType = 'directory'
+      itemType: DirectoryType = 'directory',
+      options?: {
+        scopeDirectoryId?: number | string | null;
+        groups?: number[];
+      },
     ) => {
       setModalAction(action);
       setModalTitle(title);
+      setGroupScopeDirectoryId(
+        action === 'edit' && isBuiltinCanvasGroupEditable(dir)
+          ? (options?.scopeDirectoryId ?? null)
+          : null,
+      );
 
       const initialGroups =
-        action === 'edit'
+        options?.groups ??
+        (action === 'edit'
           ? dir?.groups || []
           : action === 'addChild'
             ? dir?.groups || []
-            : [];
+            : []);
       const formData: any = {
         name: defaultValue,
         desc: action === 'edit' && dir ? dir.desc : '',
@@ -219,8 +265,8 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
           if (onDataUpdate) {
             const updatedItem = {
               ...currentDir,
-              name: isBuiltinDirectory(currentDir) ? currentDir.name : values.name,
-              desc: isBuiltinDirectory(currentDir) ? currentDir.desc : values.desc,
+              name: builtinIdentityLocked ? currentDir.name : values.name,
+              desc: builtinIdentityLocked ? currentDir.desc : values.desc,
               groups: values.groups,
             };
             onDataUpdate(updatedItem);
@@ -311,6 +357,7 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
       setModalVisible(false);
       form.resetFields();
       setCurrentDir(null);
+      setGroupScopeDirectoryId(null);
       setConnectionTesting(false);
     };
 
@@ -429,9 +476,75 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
       );
     };
 
+    const applyHomepageAction = async (item: DirItem, key: HomepageDirectoryActionKey) => {
+      const dashboardId = Number(item.data_id);
+      try {
+        if (key === 'setPersonal') {
+          await applyPersonal({ action: 'set', dashboard_id: dashboardId });
+          message.success(t('opsHomepage.setPersonalSuccess'));
+          return;
+        }
+        if (key === 'clearPersonal') {
+          await applyPersonal({ action: 'clear' });
+          message.success(t('opsHomepage.clearPersonalSuccess'));
+          return;
+        }
+        if (key === 'setGlobal') {
+          await applyGlobal({ action: 'set', dashboard_id: dashboardId });
+          message.success(t('opsHomepage.setGlobalSuccess'));
+          return;
+        }
+        await applyGlobal({ action: 'restore' });
+        message.success(t('opsHomepage.restoreGlobalSuccess'));
+      } catch {
+        // 请求层已经提示失败，设置首页后不跳转。
+      }
+    };
+
+    const withHomepageActions = (
+      item: DirItem,
+      items: MoreActionsDropdownItem[],
+    ): MoreActionsDropdownItem[] => {
+      const labels: Record<HomepageDirectoryActionKey, string> = {
+        setPersonal: t('opsHomepage.setPersonal'),
+        clearPersonal: t('opsHomepage.clearPersonal'),
+        setGlobal: t('opsHomepage.setGlobal'),
+        restoreGlobal: t('opsHomepage.restoreGlobal'),
+      };
+      if (homepageStateLoading) {
+        const placeholders = homepageDirectoryLoadingPlaceholderKeys(item);
+        if (!placeholders.length) {
+          return items;
+        }
+        return [
+          ...items,
+          ...placeholders.map((key) => ({
+            key: `homepage-${key}-loading`,
+            label: labels[key],
+            disabled: true,
+          })),
+        ];
+      }
+      const keys = homepageDirectoryActionKeys(item, homepageState);
+      if (!keys.length) {
+        return items;
+      }
+      return [
+        ...items,
+        ...keys.map((key) => ({
+          key: `homepage-${key}`,
+          label: labels[key],
+          onClick: () => {
+            void applyHomepageAction(item, key);
+          },
+        })),
+      ];
+    };
+
     const menuItemsFor = (
       item: DirItem,
       parentId: string | null = null,
+      parentItem: DirItem | null = null,
     ): MoreActionsDropdownItem[] => {
       const isRoot = parentId === null;
       const isGroup = item.type === 'directory';
@@ -441,24 +554,32 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
       const editPermission = isCatalogue ? 'EditCatalogue' : 'EditChart';
       const deletePermission = isCatalogue ? 'DeleteCatalogue' : 'DeleteChart';
 
-      const canvasResourceActions = (): MoreActionsDropdownItem[] => [
-        {
-          key: 'copy',
-          label: t('common.copy'),
-          permission: 'AddChart',
-          onClick: () => handleCopy(item),
+      const copyAction: MoreActionsDropdownItem = {
+        key: 'copy',
+        label: t('common.copy'),
+        permission: 'AddChart',
+        onClick: () => handleCopy(item),
+      };
+      const exportAction: MoreActionsDropdownItem = {
+        key: 'export',
+        label: t('opsAnalysisSidebar.exportYaml'),
+        onClick: () => handleExport(item),
+      };
+      const importUpdateAction: MoreActionsDropdownItem = {
+        key: 'importUpdate',
+        label: t('opsAnalysisSidebar.importUpdate'),
+        permission: 'EditChart',
+        onClick: () => {
+          if (!hasPermission(['EditChart'])) return;
+          setImportUpdateItem(item);
         },
-        {
-          key: 'export',
-          label: t('opsAnalysisSidebar.exportYaml'),
-          onClick: () => handleExport(item),
-        },
-      ];
+      };
+      const showResourceActions = shouldShowCanvasCopyAction(item);
 
-      // 内置目录：有编辑权即可改所属组织；内置画布可复制为用户副本，内容仍只读。
+      // 内置目录与五种内置画布：有目录编辑权时可改所属组织；内容与删除仍只读。
       if (isBuiltIn) {
         if (isCatalogue) {
-          return [
+          return withHomepageActions(item, [
             {
               key: 'edit',
               label: t('common.edit'),
@@ -474,13 +595,59 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
                 );
               },
             },
-          ];
+          ]);
         }
-        return [
-          ...(shouldShowCanvasCopyAction(item) ? canvasResourceActions() : []),
-          { key: 'edit', label: t('common.edit'), disabled: true },
-          { key: 'delete', label: t('common.delete'), disabled: true },
-        ];
+        const menuKeys = getSidebarCanvasMenuKeys(item, {
+          canEditCatalogue: hasPermission(['EditCatalogue']),
+        });
+        const parentDirectoryId =
+          parentItem?.type === 'directory' ? parentItem.data_id : null;
+        const builtinCanvasActions: MoreActionsDropdownItem[] = [];
+        if (menuKeys.includes('editGroup')) {
+          builtinCanvasActions.push({
+            key: 'editGroup',
+            label: t('opsAnalysisSidebar.editGroup'),
+            onClick: () => {
+              if (!hasPermission(['EditCatalogue'])) return;
+              const allowedGroupIds = collectDirectoryChainGroupIds(
+                dirs,
+                parentDirectoryId,
+              );
+              showModal(
+                'edit',
+                t('opsAnalysisSidebar.editGroup'),
+                item.name,
+                item,
+                item.type,
+                {
+                  scopeDirectoryId: parentDirectoryId,
+                  groups: retainAllowedGroupIds(item.groups, allowedGroupIds),
+                },
+              );
+            },
+          });
+        }
+        if (menuKeys.includes('copy') && showResourceActions) {
+          builtinCanvasActions.push(copyAction);
+        }
+        if (menuKeys.includes('export') && showResourceActions) {
+          builtinCanvasActions.push(exportAction);
+        }
+        if (menuKeys.includes('edit')) {
+          builtinCanvasActions.push({
+            key: 'edit',
+            label: t('common.edit'),
+            disabled: true,
+          });
+        }
+        if (menuKeys.includes('delete')) {
+          builtinCanvasActions.push({
+            key: 'delete',
+            label: t('common.delete'),
+            disabled: true,
+          });
+        }
+        return withHomepageActions(item, builtinCanvasActions);
       }
 
       const items: MoreActionsDropdownItem[] = [];
@@ -559,15 +726,16 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
           },
         },
       );
-      if (shouldShowCanvasCopyAction(item)) {
-        items.push(...canvasResourceActions());
+      if (showResourceActions) {
+        items.push(copyAction, exportAction, importUpdateAction);
       }
-      return items;
+      return withHomepageActions(item, items);
     };
 
     const buildTreeData = (
       items: DirItem[],
-      parentId: string | null = null
+      parentId: string | null = null,
+      parentItem: DirItem | null = null,
     ): DataNode[] =>
       items.map((item) => ({
         key: item.id,
@@ -584,19 +752,20 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
                 text={item.name || '--'}
               />
               {isBuiltinDirectory(item) && (
-                <span className="ml-1 text-[10px] text-gray-400">({t('common.builtIn')})</span>
+                <span className="ml-1 text-[10px] text-[var(--color-text-4)]">({t('common.builtIn')})</span>
               )}
             </span>
             <MoreActionsDropdown
-              items={menuItemsFor(item, parentId)}
+              items={menuItemsFor(item, parentId, parentItem)}
               placement="bottomLeft"
               stopPropagation
+              labelAlign="start"
               buttonClassName="flex-shrink-0"
             />
           </span>
         ),
         children: item.children
-          ? buildTreeData(item.children, item.id)
+          ? buildTreeData(item.children, item.id, item)
           : undefined,
       }));
 
@@ -850,18 +1019,18 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
                           form.validateFields(['canvasType']).catch(() => undefined);
                           setNewItemType(canvasType);
                         }}
-                        className={`group relative flex min-h-[104px] w-full cursor-pointer overflow-hidden rounded-md border px-3 py-3 text-left transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 ${
+                        className={`group relative flex min-h-[104px] w-full cursor-pointer overflow-hidden rounded-md border px-3 py-3 text-left transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-primary)] focus-visible:ring-offset-2 ${
                           selected
-                            ? 'border-blue-500 bg-gradient-to-br from-blue-50 to-white shadow-[0_2px_8px_rgba(37,99,235,0.08)]'
-                            : 'border-gray-200 bg-white hover:border-blue-300 hover:bg-slate-50 hover:shadow-[0_2px_6px_rgba(15,23,42,0.05)]'
+                            ? 'border-[var(--color-primary)] bg-[color-mix(in_srgb,var(--color-primary)_8%,var(--color-bg))] shadow-[0_2px_8px_color-mix(in_srgb,var(--color-primary)_12%,transparent)]'
+                            : 'border-[var(--color-border-1)] bg-[var(--color-bg)] hover:border-[var(--color-primary)] hover:bg-[var(--color-fill-1)]'
                         }`}
                       >
                         <span
                           aria-hidden="true"
                           className={`absolute right-3 top-3 flex h-5 w-5 items-center justify-center rounded-full text-[10px] transition-all ${
                             selected
-                              ? 'scale-100 bg-blue-600 text-white opacity-100 shadow-sm'
-                              : 'scale-90 bg-gray-100 text-transparent opacity-0'
+                              ? 'scale-100 bg-[var(--color-primary)] text-white opacity-100 shadow-sm'
+                              : 'scale-90 bg-[var(--color-fill-2)] text-transparent opacity-0'
                           }`}
                         >
                           <CheckOutlined />
@@ -871,15 +1040,15 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
                             <span
                               className={`flex h-8 w-8 flex-none items-center justify-center rounded-md border transition-colors ${
                                 selected
-                                  ? 'border-blue-100 bg-white shadow-sm'
-                                  : 'border-gray-100 bg-gray-50 group-hover:border-blue-100 group-hover:bg-white'
+                                  ? 'border-[color-mix(in_srgb,var(--color-primary)_24%,var(--color-border-1))] bg-[var(--color-bg)] shadow-sm'
+                                  : 'border-[var(--color-border-1)] bg-[var(--color-fill-1)] group-hover:border-[color-mix(in_srgb,var(--color-primary)_24%,var(--color-border-1))] group-hover:bg-[var(--color-bg)]'
                               }`}
                             >
                               {renderCanvasTypeIcon(canvasType)}
                             </span>
                             <span
                               className={`block text-sm font-semibold ${
-                                selected ? 'text-blue-700' : 'text-gray-900'
+                                selected ? 'text-[var(--color-primary)]' : 'text-[var(--color-text-1)]'
                               }`}
                             >
                               {t(meta.nameKey)}
@@ -887,7 +1056,7 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
                           </span>
                           <span
                             className={`mt-2 block text-xs leading-5 ${
-                              selected ? 'text-slate-600' : 'text-gray-500'
+                              selected ? 'text-[var(--color-text-2)]' : 'text-[var(--color-text-3)]'
                             }`}
                           >
                             {t(meta.descriptionKey)}
@@ -906,7 +1075,7 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
             >
               <Input
                 placeholder={t('opsAnalysisSidebar.inputPlaceholder')}
-                disabled={modalAction === 'edit' && isBuiltinDirectory(currentDir)}
+                disabled={builtinIdentityLocked}
               />
             </Form.Item>
             {showNetworkTopologyConnectionTest && (
@@ -968,6 +1137,7 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
               ]}
             >
               <GroupTreeSelect
+                treeData={builtinCanvasGroupTree}
                 placeholder={`${t('common.selectMsg')}${t('common.group')}`}
                 multiple={true}
                 mode="ownership"
@@ -977,6 +1147,7 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
               <Form.Item name="desc" label={t('opsAnalysisSidebar.descLabel')}>
                 <Input.TextArea
                   autoSize={{ minRows: 3 }}
+                  disabled={builtinIdentityLocked}
                   placeholder={`${t('common.inputMsg')} ${t('opsAnalysisSidebar.descLabel')}`}
                 />
               </Form.Item>
@@ -1008,6 +1179,28 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
             loadDirectories();
           }}
         />
+
+        {importUpdateItem && isCanvasType(importUpdateItem.type) && (
+          <ImportUpdateModal
+            visible
+            objectType={importUpdateItem.type}
+            objectId={parseInt(importUpdateItem.data_id, 10)}
+            objectName={importUpdateItem.name}
+            beforeSubmit={
+              beforeImportUpdate
+                ? () => beforeImportUpdate(importUpdateItem)
+                : undefined
+            }
+            onCancel={() => setImportUpdateItem(null)}
+            onSuccess={async (result: ImportUpdateResponse) => {
+              const updated = canvasSelectionAfterImportUpdate(importUpdateItem, result);
+              setImportUpdateItem(null);
+              onDataUpdate?.(updated);
+              onCanvasContentReplaced?.(updated);
+              await loadDirectories();
+            }}
+          />
+        )}
 
         <CopyCanvasModal
           open={copyModalVisible}

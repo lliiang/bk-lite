@@ -15,6 +15,7 @@ const DEFAULT_OTP_RECOMMENDED_APPS = [
 
 interface LoginSettingsProps {
   otpEnabled: boolean;
+  gmTransportSlot?: React.ReactNode;
   otpWhitelist: string[];
   otpRecommendedApps: string[];
   otpUsers: Array<{ value: string; label: string }>;
@@ -59,6 +60,7 @@ interface LoginSettingsProps {
 
 const LoginSettings: React.FC<LoginSettingsProps> = ({
   otpEnabled,
+  gmTransportSlot = null,
   otpWhitelist,
   otpRecommendedApps,
   otpUsers,
@@ -240,6 +242,7 @@ const LoginSettings: React.FC<LoginSettingsProps> = ({
           </div>
         )}
       </section>
+      {gmTransportSlot}
       <div className="flex items-center mb-4">
         <span className="text-xs mr-4">{t('system.security.loginExpiredTime')}</span>
         <InputNumber

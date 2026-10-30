@@ -55,6 +55,7 @@ import TreeSelector from '@/app/monitor/components/treeSelector';
 import EditConfig from './updateConfig';
 import EditInstance from './editInstance';
 import TemplateConfigDrawer from './templateConfigDrawer';
+import { canUnbindCollectTemplate } from './templateConfigDrawerLogic';
 import { buildMonitorObjectSidebarTree } from '@/app/monitor/utils/monitorObject';
 import CompactEmptyState from '@/components/compact-empty-state';
 import Permission from '@/components/permission';
@@ -67,6 +68,10 @@ import { cloneDeep } from 'lodash';
 import ResizableSidebar from '@/app/monitor/components/resizableSidebar';
 import { resolveDashboardUrl } from '@/app/monitor/dashboards/registry';
 import { buildAssetViewUrl } from './viewRoute';
+import {
+  instanceConfigSearchKeyword,
+  sameMonitorInstance
+} from './instanceConfigLink';
 import PluginTooltipContent, { PluginTooltipTrigger } from './pluginTooltip';
 import { getAssetSearchPlaceholderKey } from '@/app/monitor/utils/assetSearchPlaceholder';
 
@@ -95,6 +100,7 @@ const Asset = () => {
   const { getMonitorObject } = useMonitorApi();
   const {
     deleteMonitorInstance,
+    unbindMonitorPlugin,
     getInstanceListByPrimaryObject,
     updateCollectTemplateConfigs
   } = useIntegrationApi();
@@ -103,6 +109,8 @@ const Asset = () => {
   const commonContext = useCommon();
   const { convertToLocalizedTime } = useLocalizedTime();
   const searchparams = useSearchParams();
+  const deepInstanceId = (searchparams.get('instance_id') || '').trim();
+  const deepInstanceName = (searchparams.get('instance_name') || '').trim();
   const router = useRouter();
   const pathname = usePathname();
   const { syncObjectId } = useMonitorObjectQuery();
@@ -118,6 +126,7 @@ const Asset = () => {
   const assetRequestIdRef = useRef<number>(0);
   const instanceRef = useRef<ModalRef>(null);
   const templateDrawerRef = useRef<TemplateDrawerRef>(null);
+  const openedInstanceConfigRef = useRef('');
   const assetMenuItems = useAssetMenuItems();
   const [pagination, setPagination] = useState<Pagination>({
     current: 1,
@@ -131,7 +140,9 @@ const Asset = () => {
   const [treeLoading, setTreeLoading] = useState<boolean>(false);
   const [treeData, setTreeData] = useState<TreeItem[]>([]);
   const [tableData, setTableData] = useState<TableDataItem[]>([]);
-  const [searchText, setSearchText] = useState<string>('');
+  const [searchText, setSearchText] = useState<string>(() => (
+    deepInstanceId ? instanceConfigSearchKeyword(deepInstanceId, deepInstanceName) : ''
+  ));
   const [unassignedOnly, setUnassignedOnly] = useState(false);
   const [unassignedCount, setUnassignedCount] = useState<number | undefined>(undefined);
   const [objects, setObjects] = useState<ObjectItem[]>([]);
@@ -224,9 +235,38 @@ const Asset = () => {
       objName: findByMonitorId(objects, objectId)?.name || '',
       monitorObjId: objectId,
       plugins: record.plugins || [],
-      showTemplateList: options?.showTemplateList ?? true
+      showTemplateList: options?.showTemplateList ?? true,
+      allowUnbind: Array.isArray(record.permission)
+        ? record.permission.includes('Operate')
+        : false
     });
   };
+
+  useEffect(() => {
+    if (!deepInstanceId || !objectId || !objects.length) return undefined;
+    const stamp = `${String(objectId)}|${deepInstanceId}`;
+    if (openedInstanceConfigRef.current === stamp) return undefined;
+    let cancelled = false;
+    const keyword = instanceConfigSearchKeyword(deepInstanceId, deepInstanceName);
+    getInstanceListByPrimaryObject({
+      id: String(objectId),
+      page: 1,
+      page_size: 50,
+      name: keyword
+    }).then((data) => {
+      if (cancelled || openedInstanceConfigRef.current === stamp) return;
+      const rows = Array.isArray(data?.results) ? data.results : [];
+      const row = rows.find((item: { instance_id?: unknown }) => (
+        sameMonitorInstance(item.instance_id, deepInstanceId)
+      )) || (rows.length === 1 ? rows[0] : null);
+      if (!row) return;
+      openedInstanceConfigRef.current = stamp;
+      openTemplateDrawer(row);
+    }).catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [deepInstanceId, deepInstanceName, getInstanceListByPrimaryObject, objectId, objects]);
 
   const getPluginLatestVersion = (plugin?: {
     pack_version?: string;
@@ -299,6 +339,9 @@ const Asset = () => {
         }),
         render: (_, record: any) => {
           const plugins = record.plugins || [];
+          const canUnbind =
+            Array.isArray(record.permission) &&
+            record.permission.includes('Operate');
           if (!plugins.length) return <>--</>;
 
           return (
@@ -367,6 +410,11 @@ const Asset = () => {
                       <PluginTooltipTrigger
                         ariaLabel={`${plugin.display_name || '--'}，${statusText}`}
                         color={statusInfo.color}
+                        closable={
+                          canUnbind &&
+                          canUnbindCollectTemplate(plugin, plugins)
+                        }
+                        onClose={() => confirmUnbindTemplate(record, plugin)}
                         onActivate={() =>
                           openTemplateDrawer(record, {
                             selectedConfigId: isAuto ? plugin.name : undefined,
@@ -620,7 +668,7 @@ const Asset = () => {
         const key = String(column.key);
         let width = 150;
         if (key === ASSET_IP_COLUMN_KEY) width = 160;
-        else if (column.key === 'plugins') width = 320;
+        else if (column.key === 'plugins') width = 380;
         else if (column.key === 'organization') width = 140;
         else if (column.key === 'instance_name') width = 180;
         withWidth = { ...column, width };
@@ -920,6 +968,51 @@ const Asset = () => {
       }),
       { attachCloudDerivatives: false }
     );
+  };
+
+  const confirmUnbindTemplate = (row: any, plugin: any) => {
+    const templateName = plugin?.display_name || plugin?.name || '--';
+    modal.confirm({
+      title: t('monitor.integrations.unbindTemplateTitle'),
+      content: t('monitor.integrations.unbindTemplateContent', '', {
+        name: templateName
+      }),
+      centered: true,
+      okText: t('common.delete'),
+      cancelText: t('common.cancel'),
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        await unbindMonitorPlugin({
+          instance_id: row.instance_id,
+          monitor_plugin_id: plugin.plugin_id
+        });
+        message.success(t('monitor.integrations.unbindTemplateSuccess'));
+        const keyword = instanceConfigSearchKeyword(
+          String(row.instance_id || ''),
+          String(row.instance_name || '')
+        );
+        const [refreshed] = await Promise.all([
+          getInstanceListByPrimaryObject({
+            id: String(objectId),
+            page: 1,
+            page_size: 50,
+            name: keyword
+          }),
+          getAssetInsts(objectId)
+        ]);
+        const refreshedRow = (refreshed?.results || []).find(
+          (item: { instance_id?: unknown }) =>
+            sameMonitorInstance(item.instance_id, row.instance_id)
+        );
+        const nextPlugins = Array.isArray(refreshedRow?.plugins)
+          ? refreshedRow.plugins
+          : (row.plugins || []).filter(
+            (item: { plugin_id?: unknown }) =>
+              String(item.plugin_id) !== String(plugin.plugin_id)
+          );
+        templateDrawerRef.current?.syncPlugins(row.instance_id, nextPlugins);
+      }
+    });
   };
 
   const deleteInstConfirm = async (row: any) => {
@@ -1459,6 +1552,16 @@ const Asset = () => {
       <TemplateConfigDrawer
         ref={templateDrawerRef}
         onSuccess={() => getAssetInsts(objectId)}
+        onRequestUnbind={({ instanceId, instanceName, plugin, plugins }) =>
+          confirmUnbindTemplate(
+            {
+              instance_id: instanceId,
+              instance_name: instanceName,
+              plugins
+            },
+            plugin
+          )
+        }
       />
     </>
   );

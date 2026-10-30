@@ -54,6 +54,7 @@ import {
 } from './simple-dashboard-core';
 import { ChartData } from '@/app/monitor/types';
 import { useDashboardText } from '../../shared/utils/content-i18n';
+import { hasProDashboard } from '../../shared/utils/pro-dashboard';
 
 // ─── Icon helper ─────────────────────────────────────────────────────────────
 
@@ -726,6 +727,8 @@ export interface DashboardShellProps {
   preserveLayouts?: boolean;
   /** 可选品牌标签（如 'Cisco'）：共享对象仪表盘按实例品牌在头部高亮显示，便于辨认当前盘属于哪个品牌。 */
   brandLabel?: string;
+  /** 实例名右侧的小徽章，例如 Redis 架构芯片。 */
+  identityExtra?: React.ReactNode;
   styles: DashboardStyles;
 }
 
@@ -742,11 +745,12 @@ export const DashboardShell = ({
   preserveLayouts = false,
   unifiedChrome = true,
   brandLabel,
+  identityExtra,
   styles
 }: DashboardShellProps) => {
   const { dt } = useDashboardText();
   const showProtocolBar = FLOW_VIEW_SWITCH_ROUTE_KEYS.has(dashboard.routeKey);
-  const professionalCapable = Boolean(categoryContent);
+  const professionalCapable = hasProDashboard(dashboard.routeKey) && Boolean(categoryContent);
   const requestedMode = viewSwitcher?.mode ?? dashboard.displayMode;
   const activeMode = !professionalCapable && requestedMode === 'category' ? 'dashboard' : requestedMode;
   const showsDashboardChrome = viewSwitcher ? activeMode !== 'metrics' : dashboard.isDashboardMode;
@@ -842,6 +846,7 @@ export const DashboardShell = ({
         onFrequenceChange: dashboard.setFrequence,
         onRefresh: dashboard.onRefresh
       }}
+      identityExtra={identityExtra}
       styles={styles}
     />
   );

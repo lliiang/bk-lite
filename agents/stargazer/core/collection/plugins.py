@@ -154,19 +154,23 @@ class ConfigurationCollectionPlugin:
         if self._node_info_lookup is not None:
             await self._node_info_lookup.close()
 
+    async def job_local_node(self, target: str, *, connect_host: str = "") -> dict[str, Any] | None:
+        """同云区域且 NATS-Executor 在线时返回该节点，供本地执行和预检豁免使用。"""
+        if self._node_info_lookup is None:
+            return None
+        node_info = await self._node_info_lookup.get(target, connect_host=connect_host)
+        if isinstance(node_info, Mapping) and node_info.get("nats_executor_online") is True:
+            return dict(node_info)
+        return None
+
     async def _prepare_job_params(self, target: str, params: dict[str, Any]) -> None:
         params.pop("node_info", None)
         if str(params.get("executor_type") or "").lower() != "job":
             return
-        if self._node_info_lookup is None:
-            return
         connect_host = str(params.get("connect_ip") or params.get("host") or "")
-        node_info = await self._node_info_lookup.get(
-            target,
-            connect_host=connect_host,
-        )
+        node_info = await self.job_local_node(target, connect_host=connect_host)
         if node_info:
-            params["node_info"] = dict(node_info)
+            params["node_info"] = node_info
 
 
 class MonitorCollectionPlugin:
@@ -192,9 +196,7 @@ class MonitorCollectionPlugin:
         if monitor_type == "host":
             # 到目标 SSH Attempt 由 Responder 负责；此处不伪造 UNKNOWN→采集
             return AccessProbeResult(status=AccessProbeStatus.NOT_SUPPORTED)
-        factory = self._collector_factories.get(monitor_type)
-        if factory is None:
-            factory = _load_monitor_collector(monitor_type)
+        factory = _resolve_monitor_collector(monitor_type, self._collector_factories)
         params = _target_params(target, credential, context)
         try:
             configured_timeout = float(params.get("timeout", timeout_seconds))
@@ -219,9 +221,7 @@ class MonitorCollectionPlugin:
         monitor_type = str(context.params.get("monitor_type") or "")
         if monitor_type == "host":
             return await self._collect_host_remote(target, credential, context)
-        factory = self._collector_factories.get(monitor_type)
-        if factory is None:
-            factory = _load_monitor_collector(monitor_type)
+        factory = _resolve_monitor_collector(monitor_type, self._collector_factories)
         params = _target_params(target, credential, context)
         try:
             metrics = await factory(params).collect()
@@ -430,6 +430,16 @@ def _failure_outcome(error: str, *, value: Any = None) -> CollectOutcome:
     )
 
 
+def _resolve_monitor_collector(monitor_type: str, factories: Mapping[str, Callable] | None = None):
+    """Community Hyper-V WinRM collector wins over enterprise ClusterPerf."""
+    if monitor_type == "hyperv":
+        return _load_monitor_collector(monitor_type)
+    factory = (factories or {}).get(monitor_type)
+    if factory is not None:
+        return factory
+    return _load_monitor_collector(monitor_type)
+
+
 def _load_monitor_collector(monitor_type: str):
     if monitor_type == "vmware":
         from tasks.collectors.vmware_collector import VmwareCollector
@@ -451,6 +461,10 @@ def _load_monitor_collector(monitor_type: str):
         from tasks.collectors.host_collector import HostCollector
 
         return HostCollector
+    if monitor_type == "hyperv":
+        from tasks.collectors.hyperv_collector import HypervCollector
+
+        return HypervCollector
     if monitor_type == "cisco_meraki":
         from tasks.collectors.cisco_meraki_collector import CiscoMerakiCollector
 

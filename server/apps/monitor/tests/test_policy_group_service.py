@@ -1,8 +1,12 @@
-import pytest
+import copy
+from unittest.mock import MagicMock, patch
 
-from apps.monitor.filters.monitor_policy import exclude_policy_group_rules
+import pytest
+from django.utils import timezone
 from django_celery_beat.models import PeriodicTask
 
+from apps.core.exceptions.base_app_exception import BaseAppException, ValidationAppException
+from apps.monitor.filters.monitor_policy import exclude_policy_group_rules
 from apps.monitor.models import (
     CollectConfig,
     Metric,
@@ -19,8 +23,8 @@ from apps.monitor.models import (
     PolicyTemplate,
 )
 from apps.monitor.services.policy import PolicyService
-from apps.monitor.services.policy_group import PolicyGroupService
-from apps.core.exceptions.base_app_exception import BaseAppException
+from apps.monitor.services.policy_group import PolicyGroupService, no_data_carrier_rule_ids
+from apps.monitor.views.policy_group import _serialize_group, _serialize_rule
 
 pytestmark = pytest.mark.django_db
 
@@ -77,6 +81,219 @@ def _collect(instance, plugin):
     )
 
 
+def test_member_group_names_only_current_org_members():
+    monitor_object = _object()
+    plugin = _plugin(monitor_object, "WMI")
+    template = _template(monitor_object, plugin, "CPU")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[template],
+    )
+    foreign = PolicyGroupService.create_from_templates(
+        organization=2,
+        monitor_object=monitor_object,
+        name="其他组织",
+        templates=[template],
+    )
+    host = _instance(monitor_object, "host-a", 1)
+    left = _instance(monitor_object, "host-b", 1)
+    outsider = _instance(monitor_object, "host-c", 2)
+    PolicyGroupService.join(instance=host, group=group)
+    PolicyGroupService.join(instance=left, group=group)
+    PolicyGroupService.leave(instance=left)
+    PolicyGroupService.join(instance=outsider, group=foreign)
+
+    found = PolicyGroupService.member_group_names([host.id, left.id, outsider.id], organization=1)
+
+    assert found == {host.id: {"id": group.id, "name": "主机默认告警"}}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_rule_editor_keeps_group_fields_and_closes_alerts_for_recipe_changes():
+    monitor_object = _object()
+    plugin = _plugin(monitor_object, "WMI")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[_template(monitor_object, plugin, "CPU")],
+    )
+    rule = group.rules.get()
+    policy = rule.policy
+    policy.algorithm = "avg"
+    policy.alert_name = "旧告警名"
+    policy.schedule = {"type": "min", "value": 5}
+    policy.notice = True
+    policy.save(update_fields=["algorithm", "alert_name", "schedule", "notice", "updated_at"])
+    original_source = copy.deepcopy(policy.source)
+    host = _instance(monitor_object, "host-editor", 1)
+    alert = MonitorAlert.objects.create(policy_id=policy.id, monitor_instance_id=host.id, status="new")
+
+    closed = PolicyGroupService.apply_rule_editor(
+        rule,
+        {
+            "name": "磁盘读速过高",
+            "alert_name": "新告警名",
+            "schedule": {"type": "hour", "value": 1},
+            "notice": False,
+            "source": {"type": "instance", "values": []},
+        },
+    )
+
+    rule.refresh_from_db()
+    policy.refresh_from_db()
+    alert.refresh_from_db()
+    assert closed["closes_alerts"] is False
+    assert rule.name == "磁盘读速过高"
+    assert policy.name == "磁盘读速过高"
+    assert policy.alert_name == "新告警名"
+    assert policy.schedule == {"type": "min", "value": 5}
+    assert policy.notice is True
+    assert policy.source == original_source
+    assert alert.status == "new"
+
+    closed = PolicyGroupService.apply_rule_editor(rule, {"algorithm": "max"})
+    policy.refresh_from_db()
+    alert.refresh_from_db()
+    assert closed["closes_alerts"] is True
+    assert policy.algorithm == "max"
+    assert alert.status == "closed"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_rule_editor_name_save_ignores_form_echo():
+    monitor_object = _object()
+    plugin = _plugin(monitor_object, "Telegraf")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[_template(monitor_object, plugin, "IO")],
+    )
+    rule = group.rules.select_related("policy", "plugin").get()
+    policy = rule.policy
+    metric = Metric.objects.get(monitor_plugin=plugin, name="cpu_usage_total")
+    policy.collect_type = "host"
+    policy.metric_unit = ""
+    policy.calculation_unit = ""
+    policy.threshold_unit = ""
+    policy.query_condition = {"type": "metric", "filter": [], "metric_id": metric.id}
+    policy.schedule = {"type": "min", "value": 5}
+    policy.notice = True
+    policy.save()
+    host = _instance(monitor_object, "io-host", 1)
+    alert = MonitorAlert.objects.create(policy_id=policy.id, monitor_instance_id=host.id, status="new")
+
+    closed = PolicyGroupService.apply_rule_editor(
+        rule,
+        {
+            "name": "只改名字",
+            "collect_type": plugin.id,
+            "query_condition": {
+                "type": "metric",
+                "metric_id": metric.id,
+                "metric_name": "cpu_usage_total",
+                "filter": [],
+            },
+            "metric_unit": "percent",
+            "calculation_unit": "",
+            "threshold_unit": "",
+            "schedule": {"type": "hour", "value": 1},
+            "notice": False,
+        },
+    )
+
+    rule.refresh_from_db()
+    policy.refresh_from_db()
+    alert.refresh_from_db()
+    assert closed["closes_alerts"] is False
+    assert rule.name == "只改名字"
+    assert rule.plugin_id == plugin.id
+    assert policy.collect_type == "host"
+    assert policy.metric_unit == ""
+    assert policy.query_condition == {"type": "metric", "filter": [], "metric_id": metric.id}
+    assert policy.schedule == {"type": "min", "value": 5}
+    assert policy.notice is True
+    assert alert.status == "new"
+
+    other = _plugin(monitor_object, "Remote")
+    closed = PolicyGroupService.apply_rule_editor(rule, {"collect_type": other.id})
+    rule.refresh_from_db()
+    policy.refresh_from_db()
+    alert.refresh_from_db()
+    assert closed["closes_alerts"] is True
+    assert rule.plugin_id == other.id
+    assert policy.collect_type == "host"
+    assert alert.status == "closed"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_rule_editor_no_data_stays_on_one_rule_until_group_save():
+    group, wmi, _ssh = _mixed_group()
+    host = _instance(group.monitor_object, "web-01", 1)
+    _collect(host, wmi)
+    PolicyGroupService.join(instance=host, group=group)
+    disk_rule = group.rules.select_related("policy").get(name="WMI 磁盘")
+    cpu_rule = group.rules.select_related("policy").get(name="WMI CPU")
+
+    with _existence_query("web-01"):
+        opened = PolicyGroupService.apply_rule_editor(disk_rule, {"no_data": _no_data_payload()})
+
+    disk_rule.policy.refresh_from_db()
+    cpu_rule.policy.refresh_from_db()
+    assert opened["closes_alerts"] is False
+    assert opened["closes_no_data"] is False
+    assert "no_data" in (disk_rule.policy.enable_alerts or [])
+    assert disk_rule.policy.no_data_alert_name == "{{host}} 无数据"
+    assert "no_data" not in (cpu_rule.policy.enable_alerts or [])
+    assert _serialize_rule(disk_rule)["no_data_enabled"] is True
+    assert _serialize_rule(cpu_rule)["no_data_enabled"] is False
+    no_data_alert = MonitorAlert.objects.create(policy_id=disk_rule.policy_id, monitor_instance_id=host.id, status="new", alert_type="no_data")
+    threshold_alert = MonitorAlert.objects.create(policy_id=disk_rule.policy_id, monitor_instance_id=host.id, status="new", alert_type="alert")
+    before = set(PolicyInstanceBaseline.objects.filter(policy=disk_rule.policy).values_list("id", "metric_instance_id"))
+    assert before
+
+    with _existence_query("replaced"):
+        changed = PolicyGroupService.apply_rule_editor(
+            disk_rule,
+            {"no_data": _no_data_payload(period={"type": "min", "value": 15})},
+        )
+
+    disk_rule.policy.refresh_from_db()
+    no_data_alert.refresh_from_db()
+    threshold_alert.refresh_from_db()
+    assert changed["closes_alerts"] is False
+    assert changed["closes_no_data"] is False
+    assert disk_rule.policy.no_data_period == {"type": "min", "value": 15}
+    assert no_data_alert.status == "new"
+    assert threshold_alert.status == "new"
+    assert set(PolicyInstanceBaseline.objects.filter(policy=disk_rule.policy).values_list("id", "metric_instance_id")) == before
+
+    closed = PolicyGroupService.apply_rule_editor(disk_rule, {"no_data": {"enabled": False}})
+    disk_rule.policy.refresh_from_db()
+    no_data_alert.refresh_from_db()
+    threshold_alert.refresh_from_db()
+    assert closed["closes_alerts"] is False
+    assert closed["closes_no_data"] is True
+    assert "no_data" not in (disk_rule.policy.enable_alerts or [])
+    assert no_data_alert.status == "closed"
+    assert threshold_alert.status == "new"
+    assert not PolicyInstanceBaseline.objects.filter(policy=disk_rule.policy).exists()
+
+    with _existence_query("web-01"):
+        PolicyGroupService.apply_rule_editor(disk_rule, {"no_data": _no_data_payload()})
+        PolicyGroupService.update_detection(group, no_data=_no_data_payload())
+
+    disk_rule.policy.refresh_from_db()
+    cpu_rule.policy.refresh_from_db()
+    assert "no_data" not in (disk_rule.policy.enable_alerts or [])
+    assert "no_data" in (cpu_rule.policy.enable_alerts or [])
+    assert _serialize_rule(disk_rule)["no_data_enabled"] is False
+    assert _serialize_rule(cpu_rule, no_data_carrier=True)["no_data_carrier"] is True
+
+
 def test_create_group_keeps_one_policy_per_rule_and_skips_notice_users():
     monitor_object = _object()
     wmi = _plugin(monitor_object, "WMI")
@@ -95,10 +312,10 @@ def test_create_group_keeps_one_policy_per_rule_and_skips_notice_users():
     assert group.memberships.count() == 0
     assert group.rules.count() == 2
     assert set(group.rules.values_list("plugin__name", flat=True)) == {"WMI", "SSH"}
-    assert list(group.rules.values_list("push_alert_center", flat=True)) == [True, True]
     policies = [rule.policy for rule in group.rules.select_related("policy")]
     assert len(policies) == 2
     assert all(policy.notice_users == [] for policy in policies)
+    assert all(policy.handlers == [] for policy in policies)
     assert all(policy.source_template_id is None for policy in policies)
     assert all(policy.source == {"type": "instance", "values": []} for policy in policies)
 
@@ -480,6 +697,7 @@ def test_copy_keeps_the_current_rule_after_the_template_is_gone():
     policy.algorithm = "max"
     policy.schedule = {"type": "min", "value": 15}
     policy.notice_users = ["alice"]
+    policy.handlers = [7]
     policy.threshold = [{"level": "warning", "value": 95, "method": ">="}]
     policy.save()
     template.config = {**template.config, "metric_name": "mem_used", "threshold": [{"level": "warning", "value": 1, "method": ">="}]}
@@ -496,6 +714,7 @@ def test_copy_keeps_the_current_rule_after_the_template_is_gone():
     assert cloned.algorithm == "max"
     assert cloned.schedule == {"type": "min", "value": 15}
     assert cloned.notice_users == ["alice"]
+    assert cloned.handlers == [7]
     assert cloned.query_condition["metric_id"] == metric_id
     assert cloned.source == {"type": "instance", "values": []}
     assert cloned.source_template_id is None
@@ -703,6 +922,133 @@ def test_update_notice_writes_every_policy_and_keeps_open_alerts():
         PolicyGroupService.update_notice(group, notice=True, notice_type_ids=[], notice_users=["12"])
 
 
+def test_update_notice_writes_handlers_and_leaves_existing_alerts():
+    from apps.monitor.views.policy_group import _group_notice
+    from apps.system_mgmt.models import User
+
+    monitor_object = _object()
+    wmi = _plugin(monitor_object, "WMI")
+    ssh = _plugin(monitor_object, "SSH")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[_template(monitor_object, wmi, "WMI CPU"), _template(monitor_object, ssh, "SSH CPU")],
+    )
+    other = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="另一组",
+        templates=[_template(monitor_object, wmi, "WMI 内存")],
+    )
+    assignee = User.objects.create(
+        username="group-handler",
+        display_name="组处理人",
+        email="group-handler@example.com",
+        password="x",
+        group_list=[1],
+    )
+    outsider = User.objects.create(
+        username="group-outsider",
+        display_name="组外",
+        email="group-outsider@example.com",
+        password="x",
+        group_list=[99],
+    )
+    host = _instance(monitor_object, "web-01", 1)
+    policy = group.rules.filter(plugin=wmi).get().policy
+    alert = MonitorAlert.objects.create(
+        policy_id=policy.id,
+        monitor_instance_id=host.id,
+        status="new",
+        alert_type="alert",
+        handlers=[999],
+    )
+
+    PolicyGroupService.update_notice(group, notice=False, handlers=[assignee.id, str(assignee.id)])
+
+    for rule in group.rules.select_related("policy"):
+        rule.policy.refresh_from_db()
+        assert rule.policy.notice is False
+        assert rule.policy.notice_users == []
+        assert rule.policy.handlers == [assignee.id]
+    alert.refresh_from_db()
+    assert alert.status == "new"
+    assert alert.handlers == [999]
+    other.rules.get().policy.refresh_from_db()
+    assert other.rules.get().policy.handlers == []
+
+    listed = _group_notice(list(group.rules.select_related("policy")))
+    assert listed["handlers"] == [assignee.id]
+    assert listed["handlers_uniform"] is True
+
+    PolicyGroupService.update_notice(
+        group,
+        notice=True,
+        notice_type="email",
+        notice_type_ids=[9],
+        notice_users=["12"],
+    )
+    policy.refresh_from_db()
+    assert policy.handlers == [assignee.id]
+    assert policy.notice_users == ["12"]
+
+    with pytest.raises(ValidationAppException, match="不属于策略所属组织"):
+        PolicyGroupService.update_notice(group, notice=False, handlers=[outsider.id])
+    policy.refresh_from_db()
+    assert policy.handlers == [assignee.id]
+    assert policy.notice_users == ["12"]
+
+    PolicyGroupService.update_notice(group, notice=False, handlers=[])
+    for rule in group.rules.select_related("policy"):
+        rule.policy.refresh_from_db()
+        assert rule.policy.handlers == []
+        assert rule.policy.notice is False
+
+
+def test_group_notice_keeps_handler_uniformity_separate_from_notice():
+    from apps.monitor.views.policy_group import _group_notice
+
+    monitor_object = _object()
+    wmi = _plugin(monitor_object, "WMI")
+    ssh = _plugin(monitor_object, "SSH")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[_template(monitor_object, wmi, "WMI CPU"), _template(monitor_object, ssh, "SSH CPU")],
+    )
+    policies = [rule.policy for rule in group.rules.select_related("policy")]
+    policies[0].handlers = [3]
+    policies[0].save(update_fields=["handlers"])
+    policies[1].handlers = [4]
+    policies[1].notice = True
+    policies[1].notice_type_ids = [9]
+    policies[1].notice_users = ["4"]
+    policies[1].save(update_fields=["handlers", "notice", "notice_type_ids", "notice_users"])
+
+    mixed = _group_notice(list(group.rules.select_related("policy")))
+    assert mixed["handlers_uniform"] is False
+    assert mixed["handlers"] == []
+    assert mixed["notice_uniform"] is False
+
+    policies[0].notice = False
+    policies[0].notice_type = ""
+    policies[0].notice_type_ids = []
+    policies[0].notice_users = []
+    policies[0].save(update_fields=["notice", "notice_type", "notice_type_ids", "notice_users"])
+    policies[1].handlers = [3]
+    policies[1].notice = False
+    policies[1].notice_type = ""
+    policies[1].notice_type_ids = []
+    policies[1].notice_users = []
+    policies[1].save(update_fields=["handlers", "notice", "notice_type", "notice_type_ids", "notice_users"])
+    aligned = _group_notice(list(group.rules.select_related("policy")))
+    assert aligned["handlers"] == [3]
+    assert aligned["handlers_uniform"] is True
+    assert aligned["notice_uniform"] is True
+
+
 def test_update_enable_stops_the_group_and_resumes_from_now():
     monitor_object = _object()
     wmi = _plugin(monitor_object, "WMI")
@@ -727,9 +1073,7 @@ def test_update_enable_stops_the_group_and_resumes_from_now():
     ssh_policy = group.rules.filter(plugin=ssh).get().policy
     alert = MonitorAlert.objects.create(policy_id=wmi_policy.id, monitor_instance_id=host.id, status="new", alert_type="alert")
     other_policy = other.rules.get().policy
-    other_alert = MonitorAlert.objects.create(
-        policy_id=other_policy.id, monitor_instance_id=host.id, status="new", alert_type="alert"
-    )
+    other_alert = MonitorAlert.objects.create(policy_id=other_policy.id, monitor_instance_id=host.id, status="new", alert_type="alert")
 
     PolicyGroupService.update_enable(group, enable=False, operator="tester")
 
@@ -909,3 +1253,725 @@ def test_retiring_plugin_closes_group_policy_alerts_and_scan():
     assert group.rules.count() == 0
     host.policy_group_membership.refresh_from_db()
     assert host.policy_group_membership.state == "member"
+
+
+def _mixed_group():
+    """每个插件一条实例级规则、一条磁盘规则。磁盘规则先创建，id 更小。"""
+    monitor_object = _object()
+    wmi = _plugin(monitor_object, "WMI")
+    ssh = _plugin(monitor_object, "SSH")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[
+            _template(monitor_object, wmi, "WMI 磁盘"),
+            _template(monitor_object, wmi, "WMI CPU"),
+            _template(monitor_object, ssh, "SSH 磁盘"),
+            _template(monitor_object, ssh, "SSH CPU"),
+        ],
+    )
+    for rule in group.rules.select_related("policy"):
+        if "磁盘" in rule.name:
+            rule.policy.group_by = ["instance_id", "device"]
+            rule.policy.save(update_fields=["group_by", "updated_at"])
+    return group, wmi, ssh
+
+
+def _no_data_payload(**overrides):
+    payload = {
+        "enabled": True,
+        "period": {"type": "min", "value": 10},
+        "level": "error",
+        "alert_name": "{{host}} 无数据",
+        "recovery_period": {"type": "min", "value": 5},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _existence_query(instance_name):
+    fake = MagicMock()
+    fake.query_existence_metrics.return_value = {"data": {"result": [{"metric": {"instance_id": instance_name}}]}}
+    return patch(
+        "apps.monitor.tasks.services.policy_scan.metric_query.MetricQueryService",
+        return_value=fake,
+    )
+
+
+def _policies_by_name(group):
+    return {rule.name: rule.policy for rule in group.rules.select_related("policy")}
+
+
+def test_enabling_group_no_data_writes_one_instance_carrier_per_plugin():
+    group, wmi, ssh = _mixed_group()
+    host = _instance(monitor_object=group.monitor_object, name="web-01", organization=1)
+    _collect(host, wmi)
+    _collect(host, ssh)
+    PolicyGroupService.join(instance=host, group=group)
+    policies = _policies_by_name(group)
+    disk = policies["WMI 磁盘"]
+    disk.enable_alerts = ["threshold", "no_data"]
+    disk.no_data_period = {"type": "min", "value": 30}
+    disk.save(update_fields=["enable_alerts", "no_data_period", "updated_at"])
+    stray_alert = MonitorAlert.objects.create(policy_id=disk.id, monitor_instance_id=host.id, status="new", alert_type="no_data")
+    PolicyInstanceBaseline.objects.create(policy=disk, monitor_instance_id=host.id, metric_instance_id="disk-old")
+    threshold_alert = MonitorAlert.objects.create(policy_id=policies["WMI CPU"].id, monitor_instance_id=host.id, status="new", alert_type="alert")
+
+    with _existence_query("web-01"):
+        PolicyGroupService.update_detection(group, no_data=_no_data_payload())
+
+    policies = _policies_by_name(group)
+    carriers = []
+    for name, policy in policies.items():
+        policy.refresh_from_db()
+        enabled = "no_data" in (policy.enable_alerts or [])
+        if "CPU" in name:
+            carriers.append(policy)
+            assert enabled is True
+            assert policy.group_by == ["instance_id"]
+            assert policy.no_data_period == {"type": "min", "value": 10}
+            assert policy.no_data_level == "error"
+            assert policy.no_data_alert_name == "{{host}} 无数据"
+            assert policy.no_data_recovery_period == {"type": "min", "value": 5}
+            assert set(policy.enable_alerts) == {"threshold", "no_data"}
+            assert list(PolicyInstanceBaseline.objects.filter(policy=policy).values_list("metric_instance_id", flat=True)) == ["('web-01',)"]
+        else:
+            assert enabled is False
+            assert "threshold" in (policy.enable_alerts or [])
+            assert not PolicyInstanceBaseline.objects.filter(policy=policy).exists()
+    assert len(carriers) == 2
+    assert {policy.id for policy in carriers} == {policies["WMI CPU"].id, policies["SSH CPU"].id}
+    wmi_rules = list(group.rules.filter(plugin=wmi).order_by("id"))
+    assert wmi_rules[0].name == "WMI 磁盘"
+    assert wmi_rules[0].id < policies["WMI CPU"].group_rule.id
+    stray_alert.refresh_from_db()
+    threshold_alert.refresh_from_db()
+    assert stray_alert.status == "closed"
+    assert threshold_alert.status == "new"
+
+
+def test_disabling_group_no_data_closes_only_no_data_alerts_and_clears_baselines():
+    group, wmi, ssh = _mixed_group()
+    host = _instance(group.monitor_object, "web-01", 1)
+    _collect(host, wmi)
+    _collect(host, ssh)
+    PolicyGroupService.join(instance=host, group=group)
+    with _existence_query("web-01"):
+        PolicyGroupService.update_detection(group, no_data=_no_data_payload())
+    carrier = _policies_by_name(group)["WMI CPU"]
+    no_data_alert = MonitorAlert.objects.create(policy_id=carrier.id, monitor_instance_id=host.id, status="new", alert_type="no_data")
+    threshold_alert = MonitorAlert.objects.create(policy_id=carrier.id, monitor_instance_id=host.id, status="new", alert_type="alert")
+    assert PolicyInstanceBaseline.objects.filter(policy=carrier).exists()
+
+    PolicyGroupService.update_detection(group, no_data={"enabled": False})
+
+    carrier.refresh_from_db()
+    no_data_alert.refresh_from_db()
+    threshold_alert.refresh_from_db()
+    assert "no_data" not in (carrier.enable_alerts or [])
+    assert no_data_alert.status == "closed"
+    assert threshold_alert.status == "new"
+    assert not PolicyInstanceBaseline.objects.filter(policy_id__in=[rule.policy_id for rule in group.rules.all()]).exists()
+
+
+def test_disabling_group_no_data_makes_carriers_with_different_windows_uniform():
+    group, _wmi, _ssh = _mixed_group()
+    policies = _policies_by_name(group)
+    wmi_cpu = policies["WMI CPU"]
+    ssh_cpu = policies["SSH CPU"]
+    wmi_cpu.enable_alerts = ["threshold", "no_data"]
+    wmi_cpu.no_data_period = {"type": "min", "value": 10}
+    wmi_cpu.no_data_level = "warning"
+    wmi_cpu.no_data_alert_name = "甲"
+    wmi_cpu.no_data_recovery_period = {"type": "min", "value": 5}
+    wmi_cpu.save()
+    ssh_cpu.enable_alerts = ["threshold", "no_data"]
+    ssh_cpu.no_data_period = {"type": "min", "value": 30}
+    ssh_cpu.no_data_level = "error"
+    ssh_cpu.no_data_alert_name = "乙"
+    ssh_cpu.no_data_recovery_period = {"type": "min", "value": 10}
+    ssh_cpu.save()
+    no_data_alert = MonitorAlert.objects.create(policy_id=wmi_cpu.id, monitor_instance_id="('web-01',)", status="new", alert_type="no_data")
+    threshold_alert = MonitorAlert.objects.create(policy_id=wmi_cpu.id, monitor_instance_id="('web-01',)", status="new", alert_type="alert")
+
+    PolicyGroupService.update_detection(group, no_data={"enabled": False})
+
+    serialized = _serialize_group(group, None, metric_names={})
+    assert serialized["no_data_uniform"] is True
+    assert serialized["no_data"]["enabled"] is False
+    for policy in (wmi_cpu, ssh_cpu):
+        policy.refresh_from_db()
+        assert "no_data" not in (policy.enable_alerts or [])
+        assert policy.no_data_period == {}
+        assert policy.no_data_level == ""
+        assert policy.no_data_alert_name == ""
+        assert policy.no_data_recovery_period == {}
+    no_data_alert.refresh_from_db()
+    threshold_alert.refresh_from_db()
+    assert no_data_alert.status == "closed"
+    assert threshold_alert.status == "new"
+
+
+def test_changing_no_data_window_keeps_open_alerts_and_baselines():
+    group, wmi, ssh = _mixed_group()
+    host = _instance(group.monitor_object, "web-01", 1)
+    _collect(host, wmi)
+    _collect(host, ssh)
+    PolicyGroupService.join(instance=host, group=group)
+    with _existence_query("web-01"):
+        PolicyGroupService.update_detection(group, no_data=_no_data_payload())
+    carrier = _policies_by_name(group)["SSH CPU"]
+    alert = MonitorAlert.objects.create(policy_id=carrier.id, monitor_instance_id=host.id, status="new", alert_type="no_data")
+    before = set(PolicyInstanceBaseline.objects.filter(policy=carrier).values_list("id", "metric_instance_id"))
+
+    with _existence_query("replaced"):
+        PolicyGroupService.update_detection(
+            group,
+            no_data=_no_data_payload(period={"type": "min", "value": 15}, level="warning", alert_name="{{host}} 中断"),
+        )
+
+    carrier.refresh_from_db()
+    alert.refresh_from_db()
+    assert carrier.no_data_period == {"type": "min", "value": 15}
+    assert carrier.no_data_level == "warning"
+    assert carrier.no_data_alert_name == "{{host}} 中断"
+    assert alert.status == "new"
+    assert set(PolicyInstanceBaseline.objects.filter(policy=carrier).values_list("id", "metric_instance_id")) == before
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "enabled": True,
+            "period": {"type": "min", "value": 5},
+            "recovery_period": {"type": "min", "value": 10},
+            "level": "warning",
+            "alert_name": "无数据",
+        },
+        {
+            "enabled": True,
+            "period": {"type": "min", "value": 10},
+            "recovery_period": {"type": "min", "value": 5},
+            "level": "info",
+            "alert_name": "无数据",
+        },
+        {
+            "enabled": True,
+            "period": {"type": "min", "value": 10},
+            "recovery_period": {"type": "min", "value": 5},
+            "level": "warning",
+            "alert_name": "  ",
+        },
+        {"enabled": "yes"},
+    ],
+)
+def test_group_no_data_rejects_illegal_payloads(payload):
+    monitor_object = _object()
+    wmi = _plugin(monitor_object, "WMI")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[_template(monitor_object, wmi, "WMI CPU")],
+    )
+    with pytest.raises(ValidationAppException):
+        PolicyGroupService.update_detection(group, no_data=payload)
+    policy = group.rules.get().policy
+    policy.refresh_from_db()
+    assert "no_data" not in (policy.enable_alerts or [])
+
+
+def test_group_schedule_rewrites_crontab_without_closing_alerts_or_waking_idle_tasks():
+    monitor_object = _object()
+    wmi = _plugin(monitor_object, "WMI")
+    ssh = _plugin(monitor_object, "SSH")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[_template(monitor_object, wmi, "WMI CPU"), _template(monitor_object, ssh, "SSH CPU")],
+    )
+    host = _instance(monitor_object, "web-01", 1)
+    _collect(host, wmi)
+    PolicyGroupService.join(instance=host, group=group)
+    covered = group.rules.get(plugin=wmi).policy
+    idle = group.rules.get(plugin=ssh).policy
+    started = timezone.now()
+    MonitorPolicy.objects.filter(id=covered.id).update(last_run_time=started)
+    alert = MonitorAlert.objects.create(policy_id=covered.id, monitor_instance_id=host.id, status="new", alert_type="alert")
+
+    PolicyGroupService.update_detection(group, schedule={"type": "min", "value": 1})
+
+    covered.refresh_from_db()
+    idle.refresh_from_db()
+    alert.refresh_from_db()
+    covered_task = PeriodicTask.objects.select_related("crontab").get(name=f"scan_policy_task_{covered.id}")
+    idle_task = PeriodicTask.objects.select_related("crontab").get(name=f"scan_policy_task_{idle.id}")
+    assert covered.schedule == {"type": "min", "value": 1}
+    assert idle.schedule == {"type": "min", "value": 1}
+    assert covered.last_run_time == started
+    assert idle.last_run_time is None
+    assert alert.status == "new"
+    assert covered_task.enabled is True
+    assert covered_task.crontab.minute == "*/1"
+    assert covered_task.crontab.hour == "*"
+    assert idle_task.enabled is False
+
+    PolicyGroupService.update_enable(group, enable=False)
+    PolicyGroupService.update_detection(group, schedule={"type": "hour", "value": 2})
+
+    covered.refresh_from_db()
+    covered_task = PeriodicTask.objects.select_related("crontab").get(name=f"scan_policy_task_{covered.id}")
+    idle_task = PeriodicTask.objects.select_related("crontab").get(name=f"scan_policy_task_{idle.id}")
+    assert covered.schedule == {"type": "hour", "value": 2}
+    assert covered.last_run_time == started
+    assert covered_task.enabled is False
+    assert covered_task.crontab.hour == "*/2"
+    assert covered_task.crontab.minute == "0"
+    assert idle_task.enabled is False
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        {"type": "week", "value": 1},
+        {"type": "min", "value": 60},
+        {"type": "min", "value": 0},
+        {"type": "hour", "value": 24},
+        {"type": "day", "value": 2},
+        {"type": "min", "value": True},
+        {"type": "day", "value": "1"},
+    ],
+)
+def test_group_schedule_rejects_illegal_values(schedule):
+    monitor_object = _object()
+    wmi = _plugin(monitor_object, "WMI")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[_template(monitor_object, wmi, "WMI CPU")],
+    )
+    with pytest.raises(ValidationAppException):
+        PolicyGroupService.update_detection(group, schedule=schedule)
+    policy = group.rules.get().policy
+    policy.refresh_from_db()
+    assert policy.schedule == {"type": "min", "value": 5}
+
+
+def test_group_detection_requires_schedule_or_no_data():
+    monitor_object = _object()
+    wmi = _plugin(monitor_object, "WMI")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[_template(monitor_object, wmi, "WMI CPU")],
+    )
+    with pytest.raises(ValidationAppException, match="至少"):
+        PolicyGroupService.update_detection(group)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_trigger_count_change_closes_open_alerts_outside_a_request_transaction():
+    monitor_object = _object()
+    wmi = _plugin(monitor_object, "WMI")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[_template(monitor_object, wmi, "WMI CPU")],
+    )
+    rule = group.rules.get()
+    rule.policy.alert_name = "保持原名"
+    rule.policy.save(update_fields=["alert_name", "updated_at"])
+    host = _instance(monitor_object, "web-01", 1)
+    alert = MonitorAlert.objects.create(policy_id=rule.policy_id, monitor_instance_id=host.id, status="new")
+
+    PolicyGroupService.update_rule(rule, threshold=rule.policy.threshold, trigger_count=4)
+
+    rule.policy.refresh_from_db()
+    alert.refresh_from_db()
+    assert rule.policy.trigger_count == 4
+    assert rule.policy.alert_name == "保持原名"
+    assert alert.status == "closed"
+
+
+def test_alert_name_change_keeps_open_alerts():
+    monitor_object = _object()
+    wmi = _plugin(monitor_object, "WMI")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[_template(monitor_object, wmi, "WMI CPU")],
+    )
+    rule = group.rules.get()
+    host = _instance(monitor_object, "web-01", 1)
+    alert = MonitorAlert.objects.create(policy_id=rule.policy_id, monitor_instance_id=host.id, status="new")
+
+    PolicyGroupService.update_rule(rule, threshold=rule.policy.threshold, alert_name="{{host}} 过高")
+
+    rule.policy.refresh_from_db()
+    alert.refresh_from_db()
+    assert rule.policy.alert_name == "{{host}} 过高"
+    assert rule.policy.trigger_count == 1
+    assert alert.status == "new"
+
+
+def test_recovery_fields_close_open_alerts():
+    monitor_object = _object()
+    wmi = _plugin(monitor_object, "WMI")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[_template(monitor_object, wmi, "WMI CPU")],
+    )
+    rule = group.rules.get()
+    host = _instance(monitor_object, "web-01", 1)
+    by_condition = MonitorAlert.objects.create(policy_id=rule.policy_id, monitor_instance_id=host.id, status="new")
+    PolicyGroupService.update_rule(rule, recovery_condition=3)
+    by_condition.refresh_from_db()
+    rule.policy.refresh_from_db()
+    assert rule.policy.recovery_condition == 3
+    assert by_condition.status == "closed"
+
+    by_threshold = MonitorAlert.objects.create(policy_id=rule.policy_id, monitor_instance_id=host.id, status="new")
+    PolicyGroupService.update_rule(rule, recovery_threshold={"method": "<", "value": 10})
+    by_threshold.refresh_from_db()
+    rule.policy.refresh_from_db()
+    assert rule.policy.recovery_threshold == {"method": "<", "value": 10}
+    assert by_threshold.status == "closed"
+
+
+def test_multi_rule_rejects_recovery_threshold():
+    monitor_object = _object()
+    wmi = _plugin(monitor_object, "WMI")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[_template(monitor_object, wmi, "WMI CPU")],
+    )
+    rule = group.rules.get()
+    rule.policy.query_condition = {"type": "multi", "queries": []}
+    rule.policy.save(update_fields=["query_condition", "updated_at"])
+    host = _instance(monitor_object, "web-01", 1)
+    alert = MonitorAlert.objects.create(policy_id=rule.policy_id, monitor_instance_id=host.id, status="new")
+
+    with pytest.raises(ValidationAppException, match="恢复阈值"):
+        PolicyGroupService.update_rule(rule, recovery_threshold={"method": ">", "value": 1})
+
+    rule.policy.refresh_from_db()
+    alert.refresh_from_db()
+    assert rule.policy.recovery_threshold == {}
+    assert alert.status == "new"
+
+
+def _number_metric(monitor_object, plugin, name):
+    metric_group, _ = MetricGroup.objects.get_or_create(
+        monitor_object=monitor_object,
+        monitor_plugin=plugin,
+        name="os",
+    )
+    return Metric.objects.create(
+        monitor_object=monitor_object,
+        monitor_plugin=plugin,
+        metric_group=metric_group,
+        name=name,
+        query=f"{name}{{__$labels__}}",
+        instance_id_keys=["instance_id"],
+        data_type="Number",
+        unit="percent",
+    )
+
+
+def _multi_condition(metric, ref, group_by, algorithm="avg_over_time", group_algorithm="avg"):
+    return {
+        "ref": ref,
+        "metric_id": metric.id,
+        "filter": [],
+        "group_algorithm": group_algorithm,
+        "group_by": list(group_by),
+        "algorithm": algorithm,
+        "metric_unit": "percent",
+        "calculation_unit": "percent",
+        "threshold_unit": "percent",
+        "role": "level",
+        "threshold": [{"level": "warning", "method": ">", "value": 80}],
+    }
+
+
+def _multi_query(*conditions):
+    return {
+        "type": "multi",
+        "result_name": "磁盘与 CPU",
+        "combinator": "all",
+        "queries": list(conditions),
+    }
+
+
+def _same_plugin_rules():
+    """同一插件两条规则。磁盘先创建，id 更小。"""
+    monitor_object = _object()
+    monitor_object.instance_id_keys = ["instance_id"]
+    monitor_object.save(update_fields=["instance_id_keys"])
+    plugin = _plugin(monitor_object, "WMI")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[
+            _template(monitor_object, plugin, "磁盘"),
+            _template(monitor_object, plugin, "CPU"),
+        ],
+    )
+    disk_rule = group.rules.select_related("policy").get(name="磁盘")
+    cpu_rule = group.rules.select_related("policy").get(name="CPU")
+    return monitor_object, plugin, disk_rule, cpu_rule
+
+
+@pytest.mark.django_db(transaction=True)
+def test_rule_editor_multi_save_follows_anchor_and_picks_instance_carrier():
+    monitor_object, plugin, disk_rule, cpu_rule = _same_plugin_rules()
+    cpu = _number_metric(monitor_object, plugin, "cpu_usage")
+    disk = _number_metric(monitor_object, plugin, "disk_usage")
+    policy = disk_rule.policy
+    policy.group_by = ["instance_id", "device"]
+    policy.algorithm = "max_over_time"
+    policy.threshold = [{"level": "warning", "value": 90, "method": ">="}]
+    policy.recovery_threshold = {"method": "<", "value": 20}
+    policy.compare_mode = "previous_window"
+    policy.compare_value_kind = "delta"
+    policy.count_predicate = {"method": ">", "value": 1}
+    policy.save()
+    cpu_rule.policy.group_by = ["instance_id"]
+    cpu_rule.policy.save(update_fields=["group_by", "updated_at"])
+    host = _instance(monitor_object, "disk-host", 1)
+    alert = MonitorAlert.objects.create(policy_id=policy.id, monitor_instance_id=host.id, status="new")
+    anchor_algorithm = "avg_over_time"
+
+    PolicyGroupService.apply_rule_editor(
+        disk_rule,
+        {
+            "query_condition": _multi_query(
+                _multi_condition(disk, "a", ["instance_id"], algorithm=anchor_algorithm),
+                _multi_condition(cpu, "b", ["instance_id"], algorithm="max_over_time", group_algorithm="max"),
+            )
+        },
+    )
+
+    policy.refresh_from_db()
+    cpu_rule.policy.refresh_from_db()
+    alert.refresh_from_db()
+    assert policy.group_by == ["instance_id"]
+    assert policy.algorithm == anchor_algorithm
+    assert policy.threshold == []
+    assert policy.recovery_threshold == {}
+    assert policy.compare_mode == "absolute"
+    assert policy.count_predicate == {}
+    assert policy.query_condition["queries"][0]["group_by"] == ["instance_id"]
+    assert no_data_carrier_rule_ids([disk_rule, cpu_rule]) == {min(disk_rule.id, cpu_rule.id)}
+    assert alert.status == "closed"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_rule_editor_multi_save_drops_instance_level_when_anchor_has_extra_dimension():
+    monitor_object, plugin, disk_rule, cpu_rule = _same_plugin_rules()
+    cpu = _number_metric(monitor_object, plugin, "cpu_usage")
+    disk = _number_metric(monitor_object, plugin, "disk_usage")
+    disk_rule.policy.group_by = ["instance_id"]
+    disk_rule.policy.save(update_fields=["group_by", "updated_at"])
+    cpu_rule.policy.group_by = ["instance_id"]
+    cpu_rule.policy.save(update_fields=["group_by", "updated_at"])
+    assert disk_rule.id < cpu_rule.id
+    assert no_data_carrier_rule_ids([disk_rule, cpu_rule]) == {disk_rule.id}
+
+    PolicyGroupService.apply_rule_editor(
+        disk_rule,
+        {
+            "query_condition": _multi_query(
+                _multi_condition(disk, "a", ["instance_id", "device"]),
+                _multi_condition(cpu, "b", ["instance_id", "device"]),
+            )
+        },
+    )
+
+    disk_rule.policy.refresh_from_db()
+    assert disk_rule.policy.group_by == ["instance_id", "device"]
+    assert no_data_carrier_rule_ids([disk_rule, cpu_rule]) == {cpu_rule.id}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_rule_editor_multi_save_rejects_missing_metric_without_changing_policy():
+    monitor_object, plugin, disk_rule, cpu_rule = _same_plugin_rules()
+    disk = _number_metric(monitor_object, plugin, "disk_usage")
+    policy = disk_rule.policy
+    policy.group_by = ["instance_id", "device"]
+    policy.threshold = [{"level": "warning", "value": 90, "method": ">="}]
+    policy.save()
+    before_query = copy.deepcopy(policy.query_condition)
+    before_group_by = copy.deepcopy(policy.group_by)
+    before_threshold = copy.deepcopy(policy.threshold)
+    host = _instance(monitor_object, "disk-host", 1)
+    alert = MonitorAlert.objects.create(policy_id=policy.id, monitor_instance_id=host.id, status="new")
+    missing = _multi_condition(disk, "b", ["instance_id"])
+    missing["metric_id"] = (Metric.objects.order_by("-id").values_list("id", flat=True).first() or 0) + 1000
+
+    with pytest.raises(ValidationAppException):
+        PolicyGroupService.apply_rule_editor(
+            disk_rule,
+            {"query_condition": _multi_query(_multi_condition(disk, "a", ["instance_id"]), missing)},
+        )
+
+    policy.refresh_from_db()
+    alert.refresh_from_db()
+    assert policy.query_condition == before_query
+    assert policy.group_by == before_group_by
+    assert policy.threshold == before_threshold
+    assert alert.status == "new"
+    assert cpu_rule.policy.group_by == ["instance_id"]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"trigger_count": 0},
+        {"trigger_count": True},
+        {"trigger_count": "3"},
+        {"recovery_condition": 0},
+        {"recovery_condition": -1},
+        {"recovery_threshold": {"method": "??", "value": 1}},
+        {"recovery_threshold": {"method": ">", "value": "x"}},
+        {"alert_name": ""},
+        {"alert_name": " "},
+        {"alert_name": "名" * 201},
+    ],
+)
+def test_rule_level_fields_reject_illegal_values(kwargs):
+    monitor_object = _object()
+    wmi = _plugin(monitor_object, "WMI")
+    group = PolicyGroupService.create_from_templates(
+        organization=1,
+        monitor_object=monitor_object,
+        name="主机默认告警",
+        templates=[_template(monitor_object, wmi, "WMI CPU")],
+    )
+    rule = group.rules.get()
+    before = (
+        rule.policy.trigger_count,
+        rule.policy.recovery_condition,
+        rule.policy.recovery_threshold,
+        rule.policy.alert_name,
+    )
+    with pytest.raises(ValidationAppException):
+        PolicyGroupService.update_rule(rule, **kwargs)
+    rule.policy.refresh_from_db()
+    assert (
+        rule.policy.trigger_count,
+        rule.policy.recovery_condition,
+        rule.policy.recovery_threshold,
+        rule.policy.alert_name,
+    ) == before
+
+
+def test_copy_keeps_schedule_no_data_and_rule_fields_on_the_same_plugin_carrier():
+    group, wmi, ssh = _mixed_group()
+    for rule in group.rules.select_related("policy"):
+        policy = rule.policy
+        policy.schedule = {"type": "min", "value": 1}
+        policy.trigger_count = 3
+        policy.recovery_condition = 4
+        policy.alert_name = "{{host}} 过高"
+        policy.recovery_threshold = {} if "磁盘" in rule.name else {"method": "<", "value": 20}
+        if policy.group_by == ["instance_id"]:
+            policy.enable_alerts = ["threshold", "no_data"]
+            policy.no_data_period = {"type": "min", "value": 10}
+            policy.no_data_level = "critical"
+            policy.no_data_alert_name = "{{host}} 无数据"
+            policy.no_data_recovery_period = {"type": "min", "value": 5}
+        policy.save()
+
+    copied = PolicyGroupService.copy_group(group, name="副本")
+
+    def snapshot(target):
+        rows = {}
+        for rule in target.rules.select_related("policy", "plugin"):
+            policy = rule.policy
+            rows[(rule.plugin_id, tuple(policy.group_by or []))] = {
+                "schedule": policy.schedule,
+                "trigger_count": policy.trigger_count,
+                "recovery_condition": policy.recovery_condition,
+                "alert_name": policy.alert_name,
+                "recovery_threshold": policy.recovery_threshold,
+                "enable_alerts": policy.enable_alerts,
+                "no_data_period": policy.no_data_period,
+                "no_data_level": policy.no_data_level,
+                "no_data_alert_name": policy.no_data_alert_name,
+                "no_data_recovery_period": policy.no_data_recovery_period,
+            }
+        return rows
+
+    assert snapshot(copied) == snapshot(group)
+    copied_payload = _serialize_group(copied, None, metric_names={})
+    flags = {rule["name"]: rule["no_data_carrier"] for rule in copied_payload["rules"]}
+    assert flags["WMI CPU"] is True
+    assert flags["SSH CPU"] is True
+    assert flags["WMI 磁盘"] is False
+    assert flags["SSH 磁盘"] is False
+    copied_cpu = copied.rules.get(name="WMI CPU").policy
+    copied_cpu.schedule = {"type": "hour", "value": 3}
+    copied_cpu.save(update_fields=["schedule", "updated_at"])
+    original_cpu = group.rules.get(name="WMI CPU").policy
+    original_cpu.refresh_from_db()
+    assert original_cpu.schedule == {"type": "min", "value": 1}
+
+
+def test_group_serialization_reports_uniform_and_mixed_detection():
+    group, wmi, ssh = _mixed_group()
+    for rule in group.rules.select_related("policy"):
+        rule.policy.schedule = {"type": "min", "value": 5}
+        rule.policy.alert_name = rule.name
+        rule.policy.trigger_count = 2
+        rule.policy.recovery_condition = 3
+        rule.policy.recovery_threshold = {"method": "<", "value": 1}
+        if rule.policy.group_by == ["instance_id"]:
+            rule.policy.enable_alerts = ["threshold", "no_data"]
+            rule.policy.no_data_period = {"type": "min", "value": 10}
+            rule.policy.no_data_level = "warning"
+            rule.policy.no_data_alert_name = "无数据"
+            rule.policy.no_data_recovery_period = {"type": "min", "value": 10}
+        rule.policy.save()
+
+    uniform = _serialize_group(group, None, metric_names={})
+    assert uniform["schedule"] == {"type": "min", "value": 5}
+    assert uniform["schedule_uniform"] is True
+    assert uniform["no_data"] == {
+        "enabled": True,
+        "period": {"type": "min", "value": 10},
+        "level": "warning",
+        "alert_name": "无数据",
+        "recovery_period": {"type": "min", "value": 10},
+    }
+    assert uniform["no_data_uniform"] is True
+    cpu = next(item for item in uniform["rules"] if item["name"] == "WMI CPU")
+    assert cpu["alert_name"] == "WMI CPU"
+    assert cpu["trigger_count"] == 2
+    assert cpu["recovery_condition"] == 3
+    assert cpu["recovery_threshold"] == {"method": "<", "value": 1}
+    assert cpu["no_data_carrier"] is True
+
+    disk = group.rules.get(name="WMI 磁盘")
+    disk.policy.schedule = {"type": "hour", "value": 1}
+    disk.policy.enable_alerts = ["threshold", "no_data"]
+    disk.policy.save(update_fields=["schedule", "enable_alerts", "updated_at"])
+    mixed = _serialize_group(group, None, metric_names={})
+    assert mixed["schedule"] == {}
+    assert mixed["schedule_uniform"] is False
+    assert mixed["no_data_uniform"] is False
+    assert mixed["no_data"]["enabled"] is False
+    disk_row = next(item for item in mixed["rules"] if item["name"] == "WMI 磁盘")
+    assert disk_row["no_data_carrier"] is False

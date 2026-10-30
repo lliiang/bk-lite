@@ -86,6 +86,9 @@ const usePatchManagerApi = () => {
 
   // ── 补丁库 ──────────────────────────────────────────────────────────────────
 
+  const getWindowsServerVersions = async (): Promise<Array<{ label: string; build: string }>> =>
+    get(`${BASE}/patch/windows_versions/`);
+
   const getPatchList = async (
     params: PatchParams = {},
     config?: AxiosRequestConfig
@@ -231,9 +234,18 @@ const usePatchManagerApi = () => {
   const updateScanSetting = async (
     data: Omit<Partial<ScanSetting>, 'notification_rules'> & {
       notification_rules?: NoticeRuleInput[];
-    }
-  ): Promise<ScanSetting> =>
-    put(`${BASE}/scan_setting/save/`, data);
+    },
+    file?: File,
+  ): Promise<ScanSetting> => {
+    if (!file) return put(`${BASE}/scan_setting/save/`, data);
+    const body = new FormData();
+    body.append('payload', JSON.stringify(data));
+    body.append('file', file);
+    return put(`${BASE}/scan_setting/save/`, body, {
+      headers: { 'Content-Type': undefined },
+      timeout: 0,
+    });
+  };
 
   const getScanNotificationCandidates = async (): Promise<NoticeCandidates> =>
     get(`${BASE}/scan_setting/notification_candidates/`);
@@ -383,6 +395,7 @@ const usePatchManagerApi = () => {
     syncPatchSource,
     previewSyncPatchSource,
     ingestPatchSource,
+    getWindowsServerVersions,
     getPatchList,
     getPatchDetail,
     createPatch,

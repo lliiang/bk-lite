@@ -235,6 +235,10 @@ export interface ScanSetting {
   is_enabled: boolean;
   notification_enabled: boolean;
   notification_rules: NoticeRule[];
+  offline_catalog_enabled: boolean;
+  offline_catalog_filename: string;
+  offline_catalog_size: number;
+  offline_catalog_uploaded_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -271,6 +275,7 @@ export interface Patch {
     file_size: number;
     sha256: string;
     extension: '.msu' | '.cab';
+    dotnet_version?: string;
   } | null;
 }
 

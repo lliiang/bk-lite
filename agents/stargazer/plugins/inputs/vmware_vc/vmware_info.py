@@ -293,6 +293,8 @@ class VmwareManage(object):
                                 or self._safe_str(getattr(switch, "address", "")),
                                 # 与 CMDB 网络设备实例名格式保持一致：{ip}-switch
                                 "switch_inst_name": f"{self._safe_str(getattr(switch, 'mgmtAddr', '')) or self._safe_str(getattr(switch, 'address', ''))}-switch",
+                                # 与 CMDB 网络设备接口实例名格式保持一致：{ip}-switch-{portId}
+                                "switch_interface_inst_name": f"{self._safe_str(getattr(switch, 'mgmtAddr', '')) or self._safe_str(getattr(switch, 'address', ''))}-switch-{self._safe_str(getattr(switch, 'portId', ''))}",
                                 "switch_port": self._safe_str(getattr(switch, "portId", "")),
                                 "vlan": self._safe_str(getattr(switch, "vlan", "")),
                                 "platform": self._safe_str(getattr(switch, "hardwarePlatform", "")),

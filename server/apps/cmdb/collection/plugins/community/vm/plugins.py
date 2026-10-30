@@ -58,6 +58,7 @@ VMWARE_MODEL_FIELD_MAPPING = {
         "switch_name": "switch_name",
         "switch_ip": "switch_ip",
         "switch_inst_name": "switch_inst_name",
+        "switch_interface_inst_name": "switch_interface_inst_name",
         "switch_port": "switch_port",
         "vlan": "vlan",
         "platform": "platform",

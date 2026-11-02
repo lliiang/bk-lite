@@ -40,6 +40,7 @@ VMWARE_MODEL_FIELD_MAPPING = {
         "vcpus": (int, "vcpus"),
         "memory": (int, "memory"),
         "esxi_version": "esxi_version",
+        "boot_time": "boot_time",
         "assos": CollectVmwareMetrics.get_esxi_asso,
     },
     "vmware_ds": {

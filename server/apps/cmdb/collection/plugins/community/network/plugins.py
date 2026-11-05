@@ -13,6 +13,7 @@ NETWORK_DEVICE_MAPPING = {
     "model": "model",
     "brand": "brand",
     "sys_desc": "sysdescr",
+    "sysname": "sysname",
     "model_id": "model_id",
     "sn": CollectNetworkMetrics.get_device_sn,
 }

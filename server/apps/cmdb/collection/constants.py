@@ -113,8 +113,18 @@ NETWORK_COLLECT = [
     "network_interfaces_info_gauge",
     "network_info_gauge",
 ]
+NETWORK_SN_METRICS = frozenset({"network_sn_info_gauge", "network_sn_info"})
 NETWORK_INTERFACES_RELATIONS = "network_topo_info_gauge"
 NETWORK_TOPOLOGY_FACTS = "network_topology_facts_info_gauge"
+
+HYPERV_CLUSTER = ["hyperv_host_info_gauge", "hyperv_vm_info_gauge"]
+
+HYPERV_COLLECT_MAP = {
+    "hyperv_host_info_gauge": "hyperv_host",
+    "hyperv_vm_info_gauge": "hyperv_vm",
+    "hyperv_host_info": "hyperv_host",
+    "hyperv_vm_info": "hyperv_vm",
+}
 
 PROTOCOL_METRIC_MAP = {
     "mysql": ["mysql_info_gauge"],
@@ -201,6 +211,12 @@ QCLOUD_COLLECT_CLUSTER = [
     "qcloud_cmq_topic_info_gauge",
     "qcloud_clb_info_gauge",
     "qcloud_eip_info_gauge",
+    "qcloud_tke_cluster_info_gauge",
+    "qcloud_tke_node_info_gauge",
+    "qcloud_vpn_gateway_info_gauge",
+    "qcloud_customer_gateway_info_gauge",
+    "qcloud_vpn_connection_info_gauge",
+    "qcloud_nat_gateway_info_gauge",
     "qcloud_bucket_info_gauge",
     "qcloud_filesystem_info_gauge",
     "qcloud_domain_info_gauge",

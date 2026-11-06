@@ -1,0 +1,573 @@
+# GitLab CI/CD 配置
+# 由 .github/workflows/ 迁移而来
+# 注意：以下 GitLab Registry / 镜像仓库 / Runner 标签 / 缓存配置需按实际环境调整
+
+variables:
+  # GitLab Container Registry 地址，默认使用当前项目 registry
+  REGISTRY: "$CI_REGISTRY"
+  IMAGE_NAME: "$CI_REGISTRY_IMAGE/server-base"
+  # Docker-in-Docker 配置
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  # server 通用环境变量
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "24"
+
+# 默认镜像与缓存
+default:
+  image: ubuntu:22.04
+  tags:
+    - docker
+  cache: {}
+
+stages:
+  - import-check
+  - migrate-check
+  - celery-runtime
+  - tests
+  - collect
+  - build
+  - security
+
+# =============================================================================
+# Workflow 级别触发规则（对应 GitHub on:）
+# =============================================================================
+workflow:
+  rules:
+    # MR 触发
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # master 分支 push
+    - if: '$CI_COMMIT_BRANCH == "master"'
+    # 手动触发
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    # tag 触发（可选）
+    - if: '$CI_COMMIT_TAG'
+
+# =============================================================================
+# Server Import Check
+# =============================================================================
+server_import_check:
+  stage: import-check
+  image: python:3.12
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - server/**
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  before_script:
+    - cd server
+  script:
+    - pip install -e ".[cmdb,dev,mlops,opspilot]"
+    - python manage.py check
+  variables:
+    DB_ENGINE: sqlite
+    DB_NAME: ":memory:"
+    SECRET_KEY: gitlab-import-check
+    ENABLE_CELERY: "true"
+    MINIO_ENDPOINT: 127.0.0.1:9000
+    MINIO_ACCESS_KEY: import-check
+    MINIO_SECRET_KEY: import-check-secret
+    MINIO_USE_HTTPS: "false"
+
+# =============================================================================
+# Server Migrate Check
+# =============================================================================
+server_migrate_check:
+  stage: migrate-check
+  image: python:3.12
+  services:
+    - postgres:15
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - server/apps/**/migrations/**
+        - server/apps/**/models/**
+        - server/apps/**/models.py
+        - server/config/**
+        - server/pyproject.toml
+        - server/settings.py
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - server/apps/**/migrations/**
+        - server/apps/**/models/**
+        - server/apps/**/models.py
+        - server/config/**
+        - server/pyproject.toml
+        - server/settings.py
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends postgresql-client
+    - cd server
+  script:
+    - pip install -e ".[cmdb,dev,mlops,opspilot]"
+    - python manage.py migrate --no-input
+    - python manage.py makemigrations --check --dry-run
+  variables:
+    DB_ENGINE: postgresql
+    DB_NAME: migrate_check
+    DB_USER: postgres
+    DB_PASSWORD: migrate-check
+    DB_HOST: postgres
+    DB_PORT: "5432"
+    SECRET_KEY: gitlab-migrate-check
+    ENABLE_CELERY: "true"
+    MINIO_ENDPOINT: 127.0.0.1:9000
+    MINIO_ACCESS_KEY: migrate-check
+    MINIO_SECRET_KEY: migrate-check
+    MINIO_USE_HTTPS: "false"
+    POSTGRES_PASSWORD: migrate-check
+    POSTGRES_DB: migrate_check
+
+# =============================================================================
+# Server Celery Runtime Check
+# =============================================================================
+server_celery_full:
+  stage: celery-runtime
+  image: python:3.12
+  services:
+    - postgres:15
+    - redis:7-alpine
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - server/apps/core/celery*
+        - server/apps/core/celery_runtime/**
+        - server/apps/core/management/commands/celery*.py
+        - server/apps/core/tests/*celery*
+        - server/apps/core/tests/test_release_startup_service.py
+        - server/config/**
+        - server/Makefile
+        - server/pyproject.toml
+        - server/pytest.ini
+        - server/apps/core/testing_runner.py
+        - server/apps/core/tests/test_server_test_runner_service.py
+        - server/support-files/env/celery-runtime.env.template
+        - server/support-files/release/**
+        - server/support-files/tests/celery-runtime-requirements.txt
+        - server/scripts/check_celery_runtime.sh
+        - .gitlab-ci.yml
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - server/apps/core/celery*
+        - server/apps/core/celery_runtime/**
+        - server/apps/core/management/commands/celery*.py
+        - server/apps/core/tests/*celery*
+        - server/apps/core/tests/test_release_startup_service.py
+        - server/config/**
+        - server/Makefile
+        - server/pyproject.toml
+        - server/pytest.ini
+        - server/apps/core/testing_runner.py
+        - server/apps/core/tests/test_server_test_runner_service.py
+        - server/support-files/env/celery-runtime.env.template
+        - server/support-files/release/**
+        - server/support-files/tests/celery-runtime-requirements.txt
+        - server/scripts/check_celery_runtime.sh
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends ffmpeg
+    - cd server
+    - python -m pip install uv
+    - uv venv .venv --python 3.12
+    - uv pip install --python .venv/bin/python -e '.[cmdb,dev,mlops,opspilot]' 'factory-boy>=3.3.3' 'opentelemetry-exporter-otlp-proto-http==1.37.0' 'pytest-bdd>=8.1.0'
+  script:
+    - make test
+  variables:
+    DB_ENGINE: postgresql
+    DB_NAME: full_server_validation
+    DB_USER: postgres
+    DB_PASSWORD: full-server-validation
+    DB_HOST: postgres
+    DB_PORT: "5432"
+    SECRET_KEY: full-server-validation
+    ENABLE_CELERY: "true"
+    CELERY_BROKER_URL: redis://redis:6379/0
+    CELERY_RESULT_BACKEND: redis://redis:6379/1
+    MINIO_ENDPOINT: 127.0.0.1:9000
+    MINIO_ACCESS_KEY: full-server-validation
+    MINIO_SECRET_KEY: full-server-validation-secret
+    MINIO_USE_HTTPS: "false"
+    UV_NO_SYNC: "1"
+    PYTEST_ADDOPTS: "--maxfail=10 -o faulthandler_timeout=120"
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: full-server-validation
+    POSTGRES_DB: full_server_validation
+  artifacts:
+    when: always
+    paths:
+      - server/report.html
+      - server/coverage_html
+      - server/test-results
+    expire_in: 7 days
+
+server_celery_linux_runtime:
+  stage: celery-runtime
+  image: python:3.12
+  services:
+    - postgres:15
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - server/apps/core/celery*
+        - server/apps/core/celery_runtime/**
+        - server/apps/core/management/commands/celery*.py
+        - server/apps/core/tests/*celery*
+        - server/apps/core/tests/test_release_startup_service.py
+        - server/config/**
+        - server/Makefile
+        - server/pyproject.toml
+        - server/pytest.ini
+        - server/apps/core/testing_runner.py
+        - server/apps/core/tests/test_server_test_runner_service.py
+        - server/support-files/env/celery-runtime.env.template
+        - server/support-files/release/**
+        - server/support-files/tests/celery-runtime-requirements.txt
+        - server/scripts/check_celery_runtime.sh
+        - .gitlab-ci.yml
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - server/apps/core/celery*
+        - server/apps/core/celery_runtime/**
+        - server/apps/core/management/commands/celery*.py
+        - server/apps/core/tests/*celery*
+        - server/apps/core/tests/test_release_startup_service.py
+        - server/config/**
+        - server/Makefile
+        - server/pyproject.toml
+        - server/pytest.ini
+        - server/apps/core/testing_runner.py
+        - server/apps/core/tests/test_server_test_runner_service.py
+        - server/support-files/env/celery-runtime.env.template
+        - server/support-files/release/**
+        - server/support-files/tests/celery-runtime-requirements.txt
+        - server/scripts/check_celery_runtime.sh
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends redis-server make
+    - cd server
+    - python -m pip install -r support-files/tests/celery-runtime-requirements.txt
+  script:
+    - bash scripts/check_celery_runtime.sh /tmp/celery-runtime-evidence
+  variables:
+    CELERY_TEST_DB_PASSWORD: celery-validation
+    POSTGRES_PASSWORD: celery-validation
+    POSTGRES_DB: celery_runtime_validation
+  artifacts:
+    when: always
+    paths:
+      - /tmp/celery-runtime-evidence
+    expire_in: 7 days
+
+# =============================================================================
+# Mobile Tests
+# =============================================================================
+mobile_node_tests:
+  stage: tests
+  image: node:24
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - mobile/**
+        - .gitlab-ci.yml
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - mobile/**
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  before_script:
+    - corepack enable
+    - corepack prepare pnpm@9.15.4 --activate
+  script:
+    - cd mobile
+    - pnpm install --frozen-lockfile
+    - pnpm run test:node
+
+mobile_rust_tests:
+  stage: tests
+  image: rust:stable
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - mobile/**
+        - .gitlab-ci.yml
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - mobile/**
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends nodejs npm
+  script:
+    - cd mobile
+    - cargo test --manifest-path src-tauri/Cargo.toml
+
+# =============================================================================
+# WebChat Tests
+# =============================================================================
+webchat_build_test:
+  stage: tests
+  image: node:20
+  parallel:
+    matrix:
+      - NODE_VERSION: ["18.18.0", "20"]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - webchat/**
+        - .gitlab-ci.yml
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - webchat/**
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  before_script:
+    - npm install -g npm@latest
+  script:
+    - cd webchat
+    - npm ci
+    - npm run build
+    - npm test && npm run lint
+
+webchat_publish:
+  stage: tests
+  image: node:20
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == "master" && $WEBCHAT_PUBLISH == "true"'
+  needs:
+    - job: webchat_build_test
+      optional: false
+  before_script:
+    - npm install -g npm@latest
+    - npm config set registry https://registry.npmjs.org/
+  script:
+    - cd webchat
+    - npm ci
+    - npm run build
+    - node scripts/publish-workspaces.mjs
+
+# =============================================================================
+# Webhookd Infra Tests
+# =============================================================================
+webhookd_infra_tests:
+  stage: tests
+  image: python:3.12
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - agents/webhookd/**
+        - deploy/dist/bk-lite-kubernetes-collector/**
+        - .gitlab-ci.yml
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - agents/webhookd/**
+        - deploy/dist/bk-lite-kubernetes-collector/**
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  before_script:
+    - python --version || ln -s "$(command -v python3)" /usr/local/bin/python
+    - pip install pytest pyyaml cryptography
+  script:
+    - cd agents/webhookd/infra
+    - python3 -m pytest tests/ -q
+
+# =============================================================================
+# CMDB Collect v3 — generic amd64
+# =============================================================================
+cmdb_collect_generic:
+  stage: collect
+  image: ubuntu:22.04
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  variables:
+    DOCKER_HOST: unix:///var/run/docker.sock
+    MODEL_ID: "$MODEL_ID"
+  services:
+    - docker:24-dind
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends python3-pip docker.io
+    - pip install uv
+    - cd agents/stargazer
+    - uv sync --all-extras
+    - .venv/bin/python -m pip install requests psycopg2-binary pymysql || true
+  script:
+    - cd agents/stargazer
+    - |
+      python3 -c "
+      import sys
+      sys.path.insert(0, 'agents/stargazer')
+      from tests.collect_fixtures.catalog import lookup
+      spec = lookup('$MODEL_ID')
+      print(f'image: {spec.image}, platform: {spec.platform}')
+      " 2>&1 | tee /tmp/spec.log
+    - IMAGE=$(grep '^image:' /tmp/spec.log | awk '{print $2}')
+    - PLATFORM=$(grep '^platform:' /tmp/spec.log | awk '{print $2}')
+    - if [ -n "$IMAGE" ]; then docker pull --platform "${PLATFORM:-linux/amd64}" "$IMAGE" 2>&1 | tail -5 || true; fi
+    - .venv/bin/python -m tests.collect_fixtures.cli "$MODEL_ID" 2>&1 | tee /tmp/collect.log
+    - if [ -f "tests/fixtures/collect/$MODEL_ID.json" ]; then echo "✅ fixture $MODEL_ID.json 落盘成功"; cat "tests/fixtures/collect/$MODEL_ID.json" | head -30; else echo "❌ $MODEL_ID.json 未落盘"; exit 1; fi
+  artifacts:
+    when: always
+    paths:
+      - agents/stargazer/tests/fixtures/collect/${MODEL_ID}.json
+      - /tmp/collect.log
+    expire_in: 30 days
+
+# =============================================================================
+# CMDB Collect v3 — mycat amd64
+# =============================================================================
+cmdb_collect_mycat:
+  stage: collect
+  image: ubuntu:22.04
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  services:
+    - docker:24-dind
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends python3-pip docker.io
+    - pip install uv
+    - cd agents/stargazer
+    - uv sync --all-extras
+  script:
+    - cd agents/stargazer
+    - .venv/bin/python -m tests.collect_fixtures.cli mycat 2>&1 | tee /tmp/mycat_run.log
+    - ls -la tests/fixtures/collect/mycat.json || (echo "mycat.json 未落盘,采集失败" && exit 1)
+  artifacts:
+    when: on_success
+    paths:
+      - agents/stargazer/tests/fixtures/collect/mycat.json
+    expire_in: 30 days
+
+# =============================================================================
+# Build Server Base Image
+# =============================================================================
+build_server_base:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - server/support-files/release/Dockerfile.base
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - cd server/support-files/release
+    - docker buildx create --use || true
+    - docker buildx build \
+        --file ./Dockerfile.base \
+        --push \
+        --tag "$IMAGE_NAME:latest" \
+        --tag "$IMAGE_NAME:$CI_COMMIT_SHA" \
+        .
+
+# =============================================================================
+# Brotli 镜像补丁门禁
+# =============================================================================
+brotli_regression:
+  stage: security
+  image: python:3.12
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - deploy/security/**
+        - server/support-files/release/Dockerfile*
+        - agents/stargazer/support-files/docker/Dockerfile
+        - agents/webhookd/Dockerfile
+        - agents/fusion-collector/**/Dockerfile
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  script:
+    - python3 -m unittest discover -s deploy/security/tests -v
+
+brotli_package_layer:
+  stage: security
+  image: docker:24
+  services:
+    - docker:24-dind
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - deploy/security/**
+        - server/support-files/release/Dockerfile*
+        - agents/stargazer/support-files/docker/Dockerfile
+        - agents/webhookd/Dockerfile
+        - agents/fusion-collector/**/Dockerfile
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  parallel:
+    matrix:
+      - BASE_IMAGE: ["debian:bookworm-slim", "debian:trixie-slim", "ubuntu:24.04"]
+  script:
+    - docker build --pull --no-cache \
+        --build-arg BASE_IMAGE="$BASE_IMAGE" \
+        --build-arg RUNTIME_USER=0 \
+        -f deploy/security/Dockerfile.system \
+        -t brotli-package-check deploy/security
+    - docker run --rm --network none --read-only --cpus=1 --memory=128m \
+        --pids-limit=64 --cap-drop ALL --security-opt no-new-privileges \
+        --entrypoint dpkg-query brotli-package-check \
+        -W -f='${Package} ${Version}\n' libbrotli1
+
+brotli_node_overlay:
+  stage: security
+  image: docker:24
+  services:
+    - docker:24-dind
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - deploy/security/**
+        - server/support-files/release/Dockerfile*
+        - agents/stargazer/support-files/docker/Dockerfile
+        - agents/webhookd/Dockerfile
+        - agents/fusion-collector/**/Dockerfile
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  script:
+    - docker build --pull --no-cache \
+        --build-arg BASE_IMAGE=bk-lite.tencentcloudcr.com/bklite/falkordb/falkordb@sha256:22dd71a5e852eba99223c52e03b4ce871e0cd279c7931c117a6325610c247159 \
+        --build-arg RUNTIME_USER=1000 \
+        -f deploy/security/Dockerfile.falkordb \
+        -t brotli-node-check deploy/security
+    - test "$(docker image inspect --format '{{.Config.User}}' brotli-node-check)" = '1000'
+    - docker run --rm --network none --read-only --cpus=1 --memory=128m \
+        --pids-limit=64 --cap-drop ALL --security-opt no-new-privileges \
+        --entrypoint sh brotli-node-check -c \
+        'node --version && dpkg-query -W nodejs libbrotli1'
+
+brotli_log4j_images:
+  stage: security
+  image: docker:24
+  services:
+    - docker:24-dind
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - deploy/security/**
+        - server/support-files/release/Dockerfile*
+        - agents/stargazer/support-files/docker/Dockerfile
+        - agents/webhookd/Dockerfile
+        - agents/fusion-collector/**/Dockerfile
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  parallel:
+    matrix:
+      - PRODUCT: ["conductor"]
+        BASE_IMAGE: ["bk-lite.tencentcloudcr.com/bklite/conductoross/conductor@sha256:60496edc8e53a9cc19128b82f56b4c0bee7c67c586719c5992cde5c085750648"]
+      - PRODUCT: ["elasticsearch"]
+        BASE_IMAGE: ["docker.elastic.co/elasticsearch/elasticsearch:7.17.21"]
+  script:
+    - docker pull "$BASE_IMAGE"
+    - user=$(docker image inspect --format '{{.Config.User}}' "$BASE_IMAGE")
+    - docker build --pull --no-cache \
+        --build-arg BASE_IMAGE="$BASE_IMAGE" \
+        --build-arg RUNTIME_USER="${user:-0}" \
+        -f "deploy/security/Dockerfile.$PRODUCT" \
+        -t "security-log4j-$PRODUCT" deploy/security
+    - actual_user=$(docker image inspect --format '{{.Config.User}}' "security-log4j-$PRODUCT")
+    - test "${actual_user:-0}" = "${user:-0}"
+    - test "$(docker image inspect --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}}' "$BASE_IMAGE")" = "$(docker image inspect --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}}' "security-log4j-$PRODUCT")"

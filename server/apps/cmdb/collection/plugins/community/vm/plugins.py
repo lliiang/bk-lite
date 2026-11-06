@@ -1,7 +1,9 @@
 from apps.cmdb.collection.collect_plugin.vmware import CollectVmwareMetrics
 from apps.cmdb.collection.constants import VMWARE_CLUSTER
-from apps.cmdb.collection.plugins.base import AutoRegisterCollectionPluginMixin, bind_collection_mapping
+from apps.cmdb.collection.plugins.base import AutoRegisterCollectionPluginMixin
+from apps.cmdb.collection.plugins.base import bind_collection_mapping
 from apps.cmdb.constants.constants import CollectPluginTypes
+
 
 VMWARE_MODEL_FIELD_MAPPING = {
     "vmware_vc": {
@@ -49,6 +51,20 @@ VMWARE_MODEL_FIELD_MAPPING = {
         "storage": (int, "storage"),
         "url": "ds_url",
     },
+    "vmware_esxi_cdp": {
+        "inst_name": "inst_name",
+        "vmware_esxi": CollectVmwareMetrics.get_vm_esxi_name,
+        "nic_name": "nic_name",
+        "nic_mac": "nic_mac",
+        "switch_name": "switch_name",
+        "switch_ip": "switch_ip",
+        "switch_inst_name": "switch_inst_name",
+        "switch_interface_inst_name": "switch_interface_inst_name",
+        "switch_port": "switch_port",
+        "vlan": "vlan",
+        "platform": "platform",
+        "version": "version",
+    },
 }
 
 
@@ -64,4 +80,7 @@ class VmwareVCCollectionPlugin(AutoRegisterCollectionPluginMixin, CollectVmwareM
 
     @property
     def model_field_mapping(self):
-        return {model_id: bind_collection_mapping(self, mapping) for model_id, mapping in VMWARE_MODEL_FIELD_MAPPING.items()}
+        return {
+            model_id: bind_collection_mapping(self, mapping)
+            for model_id, mapping in VMWARE_MODEL_FIELD_MAPPING.items()
+        }
